@@ -1,0 +1,60 @@
+# Build products
+/build/
+/bin/
+/lib/
+*.o
+*.obj
+*.d
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Debugging, profiling, coverage, and crash artifacts
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+*.gmon
+*.core
+core
+core.[0-9]*
+vgcore.*
+
+# Generated build metadata
+compile_commands.json
+
+# Local experiment files and generated results
+/data/*
+!/data/.gitkeep
+/reports/results/
+/logs/
+*.log
+*.pcap
+*.pcapng
+
+# Local configuration and secrets
+.env
+.env.*
+
+# Editor and IDE state
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+*:Zone.Identifier
+
+# Python cache if a small analysis helper is added later
+__pycache__/
+*.py[cod]
