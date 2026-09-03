@@ -2,8 +2,6 @@
 
 EE542 Lab 2 project for a fast, reliable file-transfer protocol over IP.
 
-This is a three-day C++ lab, so the design intentionally stays small and direct. GNU Make
-is the only build system; CMake is not used.
 
 ## Layout
 
