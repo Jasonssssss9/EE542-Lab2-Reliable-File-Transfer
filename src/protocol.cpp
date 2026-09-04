@@ -193,22 +193,35 @@ bool deserialize_start_ack(const std::vector<std::uint8_t>& data, StartAckPayloa
 }
 
 std::vector<std::uint8_t> serialize_ack(const AckPayload& payload) {
-    std::vector<std::uint8_t> out(16, 0);
+    const std::size_t bitmap_bytes = (payload.bitmap_bits + 7) / 8;
+    if (payload.bitmap.size() != bitmap_bytes) {
+        throw std::invalid_argument("ACK bitmap length does not match bitmap_bits");
+    }
+
+    std::vector<std::uint8_t> out(16 + bitmap_bytes, 0);
     write_u32(out, 0, payload.cumulative_ack);
     write_u32(out, 4, payload.largest_received_plus_one);
     write_u32(out, 8, payload.bitmap_base);
     write_u16(out, 12, payload.bitmap_bits);
+    std::copy(payload.bitmap.begin(), payload.bitmap.end(), out.begin() + 16);
     return out;
 }
 
 bool deserialize_ack(const std::vector<std::uint8_t>& data, AckPayload& payload) {
-    if (data.size() != 16) {
+    if (data.size() < 16) {
         return false;
     }
+    const std::uint16_t bitmap_bits = read_u16(data.data() + 12);
+    const std::size_t bitmap_bytes = (bitmap_bits + 7) / 8;
+    if (data.size() != 16 + bitmap_bytes) {
+        return false;
+    }
+
     payload.cumulative_ack = read_u32(data.data());
     payload.largest_received_plus_one = read_u32(data.data() + 4);
     payload.bitmap_base = read_u32(data.data() + 8);
-    payload.bitmap_bits = read_u16(data.data() + 12);
+    payload.bitmap_bits = bitmap_bits;
+    payload.bitmap.assign(data.begin() + 16, data.end());
     return true;
 }
 

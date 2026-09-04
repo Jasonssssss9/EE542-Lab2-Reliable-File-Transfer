@@ -1,6 +1,7 @@
 #include "protocol.hpp"
 #include "reliability.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -14,6 +15,29 @@ void check(bool condition, const std::string& message) {
     if (!condition) {
         std::cerr << "FAIL: " << message << '\n';
         ++failures;
+    }
+}
+
+void set_ack_bit(frft::AckPayload& ack, std::uint32_t bit) {
+    ack.bitmap[bit / 8] |= static_cast<std::uint8_t>(1U << (bit % 8));
+}
+
+bool ack_bit(const frft::AckPayload& ack, std::uint32_t bit) {
+    return (ack.bitmap[bit / 8] & (1U << (bit % 8))) != 0;
+}
+
+void send_initial_chunks(frft::SenderWindow& sender,
+                         std::uint32_t count,
+                         std::chrono::steady_clock::time_point time) {
+    for (std::uint32_t sequence = 0; sequence < count; ++sequence) {
+        const auto decision = sender.select_next_packet();
+        check(decision.has_value(), "sender has an initial packet to select");
+        if (!decision) {
+            return;
+        }
+        check(!decision->retransmission && decision->sequence == sequence,
+              "initial packets are selected in sequence order");
+        sender.mark_sent(decision->sequence, time);
     }
 }
 
@@ -67,11 +91,15 @@ void test_control_payloads() {
               decoded_start_ack.accepted_window_chunks == 512,
           "START_ACK payload round trip");
 
-    const frft::AckPayload ack {100, 104, 100, 0};
+    frft::AckPayload ack {100, 104, 100, 16, std::vector<std::uint8_t>(2, 0)};
+    set_ack_bit(ack, 1);
+    set_ack_bit(ack, 3);
     frft::AckPayload decoded_ack;
     check(frft::deserialize_ack(frft::serialize_ack(ack), decoded_ack), "ACK payload decodes");
-    check(decoded_ack.cumulative_ack == 100 && decoded_ack.bitmap_bits == 0,
-          "Stage 1 cumulative ACK round trip");
+    check(decoded_ack.cumulative_ack == 100 && decoded_ack.bitmap_base == 100 &&
+              decoded_ack.bitmap_bits == 16,
+          "ACK prefix survives round trip");
+    check(decoded_ack.bitmap == ack.bitmap, "SACK bitmap survives round trip");
 
     const frft::CompleteAckPayload complete {
         frft::StatusCode::OK, 1234, 0x0102030405060708ULL, 987654};
@@ -83,21 +111,102 @@ void test_control_payloads() {
           "COMPLETE_ACK payload round trip");
 }
 
-void test_stage_one_window_state() {
-    frft::SenderWindow sender(5, 2);
-    check(sender.can_send() && sender.take_next_sequence() == 0, "sender selects chunk zero");
-    check(sender.can_send() && sender.take_next_sequence() == 1, "sender fills its window");
-    check(!sender.can_send(), "sender stops at the fixed window edge");
-    check(sender.apply_cumulative_ack(1), "cumulative ACK advances window base");
-    check(sender.can_send() && sender.take_next_sequence() == 2, "ACK opens one window slot");
+void test_receiver_sack_and_gap_filling() {
+    frft::ReceiverTracker receiver(8);
+    check(receiver.mark_received(1), "receiver accepts chunk 1 out of order");
+    check(receiver.mark_received(2), "receiver accepts chunk 2 out of order");
+    check(receiver.mark_received(3), "receiver accepts chunk 3 out of order");
+    check(receiver.cumulative_ack() == 0, "missing chunk 0 holds cumulative ACK at zero");
 
-    frft::ReceiverTracker receiver(4);
-    check(receiver.mark_received(1), "receiver accepts out-of-order chunk");
-    check(receiver.cumulative_ack() == 0, "gap holds cumulative ACK at zero");
-    check(receiver.mark_received(0), "receiver accepts missing prefix chunk");
-    check(receiver.cumulative_ack() == 2, "cumulative ACK crosses filled gap");
-    check(!receiver.mark_received(1) && receiver.received_count() == 2,
-          "duplicate chunk does not change receive count");
+    const auto sack = receiver.make_ack_snapshot(8);
+    check(sack.cumulative_ack == 0 && sack.bitmap_base == 0 && sack.bitmap_bits == 8,
+          "receiver SACK uses cumulative ACK as bitmap base");
+    check(!ack_bit(sack, 0) && ack_bit(sack, 1) && ack_bit(sack, 2) && ack_bit(sack, 3),
+          "receiver SACK reports the gap and later received chunks");
+
+    check(receiver.mark_received(0), "receiver accepts the missing prefix chunk");
+    check(receiver.cumulative_ack() == 4,
+          "filling the gap advances ACK across already received chunks");
+    check(!receiver.mark_received(1) && receiver.received_count() == 4,
+          "duplicate DATA does not change receive count");
+}
+
+void test_sender_ack_processing_and_window() {
+    const auto sent_time = std::chrono::steady_clock::time_point {};
+    frft::SenderWindow sender(5, 2);
+    send_initial_chunks(sender, 2, sent_time);
+    check(!sender.select_next_packet(), "sender stops at the fixed window edge");
+
+    frft::AckPayload ack {1, 2, 1, 8, std::vector<std::uint8_t>(1, 0)};
+    set_ack_bit(ack, 0);
+    sender.process_ack(ack);
+    check(sender.state(0) == frft::PacketState::ACKED,
+          "cumulative ACK marks the prefix ACKED");
+    check(sender.state(1) == frft::PacketState::ACKED,
+          "SACK marks a non-contiguous chunk ACKED");
+    check(sender.base() == 2, "ACK processing advances contiguous sender base");
+
+    const auto next = sender.select_next_packet();
+    check(next && next->sequence == 2 && !next->retransmission,
+          "ACKed chunks open the fixed window");
+}
+
+void test_fast_retransmit() {
+    const auto sent_time = std::chrono::steady_clock::time_point {};
+    frft::SenderWindow sender(105, 105);
+    send_initial_chunks(sender, 104, sent_time);
+
+    frft::AckPayload ack {100, 104, 100, 8, std::vector<std::uint8_t>(1, 0)};
+    set_ack_bit(ack, 1);
+    set_ack_bit(ack, 2);
+    set_ack_bit(ack, 3);
+    sender.process_ack(ack);
+
+    check(sender.state(100) == frft::PacketState::IN_FLIGHT,
+          "missing chunk remains in flight before retransmission");
+    check(sender.retransmit_pending(100),
+          "three later ACKed chunks make the missing chunk retransmission-pending");
+    const auto retransmission = sender.select_next_packet();
+    check(retransmission && retransmission->retransmission &&
+              retransmission->sequence == 100,
+          "pending retransmission is selected before new DATA");
+}
+
+void test_duplicate_and_reordered_ack_safety() {
+    const auto sent_time = std::chrono::steady_clock::time_point {};
+    frft::SenderWindow sender(8, 8);
+    send_initial_chunks(sender, 6, sent_time);
+
+    frft::AckPayload newer {2, 6, 2, 8, std::vector<std::uint8_t>(1, 0)};
+    set_ack_bit(newer, 3);
+    sender.process_ack(newer);
+    check(sender.state(5) == frft::PacketState::ACKED, "new SACK marks chunk 5 ACKED");
+
+    frft::AckPayload older {1, 2, 1, 8, std::vector<std::uint8_t>(1, 0)};
+    sender.process_ack(older);
+    sender.process_ack(older);
+    check(sender.state(5) == frft::PacketState::ACKED,
+          "old and duplicate ACKs cannot undo ACKed state");
+}
+
+void test_rto_and_completion() {
+    const auto sent_time = std::chrono::steady_clock::time_point {};
+    frft::SenderWindow sender(2, 2);
+    send_initial_chunks(sender, 2, sent_time);
+
+    frft::AckPayload ack {0, 2, 0, 8, std::vector<std::uint8_t>(1, 0)};
+    set_ack_bit(ack, 1);
+    sender.process_ack(ack);
+    check(!sender.all_acked(), "sender is incomplete while one chunk is missing");
+
+    sender.check_timeouts(sent_time + std::chrono::milliseconds(501),
+                          std::chrono::milliseconds(500));
+    check(sender.retransmit_pending(0), "expired in-flight chunk becomes pending");
+    check(!sender.retransmit_pending(1), "ACKed chunk does not time out");
+
+    frft::AckPayload complete {2, 2, 2, 8, std::vector<std::uint8_t>(1, 0)};
+    sender.process_ack(complete);
+    check(sender.all_acked(), "sender completes only after every chunk is ACKed");
 }
 
 }  // namespace
@@ -105,7 +214,11 @@ void test_stage_one_window_state() {
 int main() {
     test_header_and_data();
     test_control_payloads();
-    test_stage_one_window_state();
+    test_receiver_sack_and_gap_filling();
+    test_sender_ack_processing_and_window();
+    test_fast_retransmit();
+    test_duplicate_and_reordered_ack_safety();
+    test_rto_and_completion();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

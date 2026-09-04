@@ -1,39 +1,123 @@
 #include "reliability.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 namespace frft {
 
 SenderWindow::SenderWindow(std::uint32_t total_chunks, std::uint32_t window_chunks)
-    : total_chunks_(total_chunks), window_chunks_(window_chunks) {
+    : total_chunks_(total_chunks),
+      window_chunks_(window_chunks),
+      chunks_(total_chunks) {
     if (window_chunks == 0) {
         throw std::invalid_argument("window must contain at least one chunk");
     }
 }
 
-bool SenderWindow::can_send() const {
+bool SenderWindow::can_send_new() const {
     return next_sequence_ < total_chunks_ &&
            static_cast<std::uint64_t>(next_sequence_) <
                static_cast<std::uint64_t>(base_) + window_chunks_;
 }
 
-std::uint32_t SenderWindow::take_next_sequence() {
-    if (!can_send()) {
-        throw std::logic_error("sender window has no packet ready");
+std::optional<SendDecision> SenderWindow::select_next_packet() {
+    while (!retransmission_queue_.empty()) {
+        const std::uint32_t sequence = retransmission_queue_.front();
+        retransmission_queue_.pop_front();
+        ChunkState& chunk = chunks_[sequence];
+        if (chunk.state == PacketState::IN_FLIGHT && chunk.retransmit_pending) {
+            chunk.retransmit_pending = false;
+            chunk.fast_retransmitted = true;
+            return SendDecision {sequence, true};
+        }
     }
-    return next_sequence_++;
+
+    if (can_send_new()) {
+        return SendDecision {next_sequence_++, false};
+    }
+    return std::nullopt;
 }
 
-bool SenderWindow::apply_cumulative_ack(std::uint32_t cumulative_ack) {
-    if (cumulative_ack > total_chunks_ || cumulative_ack > next_sequence_) {
-        return false;
+void SenderWindow::mark_sent(std::uint32_t sequence,
+                             std::chrono::steady_clock::time_point send_time) {
+    if (sequence >= next_sequence_ || chunks_[sequence].state == PacketState::ACKED) {
+        throw std::logic_error("cannot mark an unselected or ACKed chunk as sent");
     }
-    if (cumulative_ack > base_) {
-        base_ = cumulative_ack;
-        return true;
+    chunks_[sequence].state = PacketState::IN_FLIGHT;
+    chunks_[sequence].last_sent_time = send_time;
+}
+
+void SenderWindow::mark_acked(std::uint32_t sequence) {
+    if (sequence >= next_sequence_ || sequence >= total_chunks_) {
+        return;
     }
-    return false;
+    chunks_[sequence].state = PacketState::ACKED;
+    chunks_[sequence].retransmit_pending = false;
+}
+
+void SenderWindow::queue_retransmission(std::uint32_t sequence, bool fast_retransmit) {
+    ChunkState& chunk = chunks_[sequence];
+    if (chunk.state != PacketState::IN_FLIGHT || chunk.retransmit_pending) {
+        return;
+    }
+    chunk.retransmit_pending = true;
+    if (fast_retransmit) {
+        chunk.fast_retransmitted = true;
+    }
+    retransmission_queue_.push_back(sequence);
+}
+
+void SenderWindow::advance_base() {
+    while (base_ < total_chunks_ && chunks_[base_].state == PacketState::ACKED) {
+        ++base_;
+    }
+}
+
+void SenderWindow::process_ack(const AckPayload& ack) {
+    const std::uint32_t prefix_end =
+        std::min({ack.cumulative_ack, total_chunks_, next_sequence_});
+    for (std::uint32_t sequence = 0; sequence < prefix_end; ++sequence) {
+        mark_acked(sequence);
+    }
+
+    const std::size_t available_bits = std::min<std::size_t>(
+        ack.bitmap_bits, ack.bitmap.size() * 8);
+    for (std::size_t bit = 0; bit < available_bits; ++bit) {
+        if ((ack.bitmap[bit / 8] & (1U << (bit % 8))) == 0) {
+            continue;
+        }
+        const std::uint64_t sequence = static_cast<std::uint64_t>(ack.bitmap_base) + bit;
+        if (sequence < total_chunks_ && sequence < next_sequence_) {
+            mark_acked(static_cast<std::uint32_t>(sequence));
+        }
+    }
+
+    advance_base();
+
+    std::uint32_t later_acked = 0;
+    for (std::uint32_t sequence = next_sequence_; sequence > base_;) {
+        --sequence;
+        ChunkState& chunk = chunks_[sequence];
+        if (chunk.state == PacketState::ACKED) {
+            ++later_acked;
+        } else if (chunk.state == PacketState::IN_FLIGHT &&
+                   later_acked >= kFastRetransmitThreshold &&
+                   !chunk.fast_retransmitted) {
+            queue_retransmission(sequence, true);
+        }
+    }
+}
+
+void SenderWindow::check_timeouts(std::chrono::steady_clock::time_point now,
+                                  std::chrono::milliseconds rto) {
+    for (std::uint32_t sequence = base_; sequence < next_sequence_; ++sequence) {
+        const ChunkState& chunk = chunks_[sequence];
+        if (chunk.state == PacketState::IN_FLIGHT && !chunk.retransmit_pending &&
+            now - chunk.last_sent_time >= rto) {
+            queue_retransmission(sequence, false);
+        }
+    }
 }
 
 bool SenderWindow::all_acked() const {
@@ -46,6 +130,20 @@ std::uint32_t SenderWindow::base() const {
 
 std::uint32_t SenderWindow::next_sequence() const {
     return next_sequence_;
+}
+
+PacketState SenderWindow::state(std::uint32_t sequence) const {
+    if (sequence >= total_chunks_) {
+        throw std::out_of_range("chunk sequence is outside the transfer");
+    }
+    return chunks_[sequence].state;
+}
+
+bool SenderWindow::retransmit_pending(std::uint32_t sequence) const {
+    if (sequence >= total_chunks_) {
+        return false;
+    }
+    return chunks_[sequence].retransmit_pending;
 }
 
 ReceiverTracker::ReceiverTracker(std::uint32_t total_chunks) : received_(total_chunks, 0) {}
@@ -82,6 +180,26 @@ std::uint32_t ReceiverTracker::cumulative_ack() const {
 
 std::uint32_t ReceiverTracker::largest_received_plus_one() const {
     return largest_received_plus_one_;
+}
+
+AckPayload ReceiverTracker::make_ack_snapshot(std::uint16_t bitmap_bits) const {
+    AckPayload ack;
+    ack.cumulative_ack = cumulative_ack_;
+    ack.largest_received_plus_one = largest_received_plus_one_;
+    ack.bitmap_base = cumulative_ack_;
+    ack.bitmap_bits = bitmap_bits;
+    ack.bitmap.assign((bitmap_bits + 7) / 8, 0);
+
+    for (std::uint32_t bit = 0; bit < bitmap_bits; ++bit) {
+        const std::uint64_t sequence = static_cast<std::uint64_t>(ack.bitmap_base) + bit;
+        if (sequence >= received_.size()) {
+            break;
+        }
+        if (received_[sequence] != 0) {
+            ack.bitmap[bit / 8] |= static_cast<std::uint8_t>(1U << (bit % 8));
+        }
+    }
+    return ack;
 }
 
 }  // namespace frft

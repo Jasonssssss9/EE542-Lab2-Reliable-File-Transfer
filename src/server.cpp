@@ -143,15 +143,12 @@ void send_ack(int socket_fd,
               const sockaddr_in& client,
               std::uint32_t session_id,
               std::uint32_t ack_number,
-              const frft::ReceiverTracker& tracker) {
-    const frft::AckPayload ack {
-        tracker.cumulative_ack(),
-        tracker.largest_received_plus_one(),
-        tracker.cumulative_ack(),
-        0,
-    };
+              const frft::ReceiverTracker& tracker,
+              std::uint16_t bitmap_bits) {
+    const frft::AckPayload ack = tracker.make_ack_snapshot(bitmap_bits);
     const auto payload = frft::serialize_ack(ack);
-    const auto header = make_header(frft::PacketType::ACK, session_id, ack_number);
+    auto header = make_header(frft::PacketType::ACK, session_id, ack_number);
+    header.flags = frft::FLAG_SACK;
     send_packet(socket_fd, client, header, payload.data(), payload.size());
 }
 
@@ -160,7 +157,7 @@ void time_wait(int socket_fd,
                std::uint32_t session_id,
                std::uint32_t total_chunks,
                const std::vector<std::uint8_t>& complete_ack_payload) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     std::vector<std::uint8_t> buffer(65535);
 
     while (std::chrono::steady_clock::now() < deadline) {
@@ -207,6 +204,7 @@ void time_wait(int socket_fd,
                         header,
                         complete_ack_payload.data(),
                         complete_ack_payload.size());
+            deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         }
     }
 }
@@ -244,8 +242,8 @@ int run_server(const Options& options) {
 
             bool valid = start.chunk_size == frft::chunk_size_for_mtu(options.mtu) &&
                          start.total_chunks == frft::chunk_count(start.file_size, start.chunk_size) &&
-                         start.window_chunks > 0 && start.ack_bitmap_bits > 0 &&
-                         start.window_chunks <= start.ack_bitmap_bits;
+                         start.window_chunks > 0 &&
+                         start.ack_bitmap_bits == frft::kDefaultAckBitmapBits;
             if (!valid) {
                 const frft::StartAckPayload rejected {frft::StatusCode::INVALID_REQUEST, 0, 0, 0};
                 send_start_ack(socket_fd, client, start_packet.header.session_id, rejected);
@@ -266,8 +264,8 @@ int run_server(const Options& options) {
 
         const frft::StartAckPayload accepted {
             frft::StatusCode::OK,
-            start.window_chunks,
-            start.ack_bitmap_bits,
+            std::min<std::uint32_t>(start.window_chunks, frft::kDefaultAckBitmapBits),
+            frft::kDefaultAckBitmapBits,
             start.ack_interval_ms,
         };
         send_start_ack(socket_fd, client, session_id, accepted);
@@ -323,7 +321,12 @@ int run_server(const Options& options) {
                     }
                     last_data_time = now;
                 }
-                send_ack(socket_fd, client, session_id, ack_number++, tracker);
+                send_ack(socket_fd,
+                         client,
+                         session_id,
+                         ack_number++,
+                         tracker,
+                         accepted.accepted_bitmap_bits);
                 continue;
             }
 
@@ -332,7 +335,12 @@ int run_server(const Options& options) {
                 continue;
             }
             if (!tracker.complete() || tracker.cumulative_ack() != start.total_chunks) {
-                send_ack(socket_fd, client, session_id, ack_number++, tracker);
+                send_ack(socket_fd,
+                         client,
+                         session_id,
+                         ack_number++,
+                         tracker,
+                         accepted.accepted_bitmap_bits);
                 continue;
             }
 

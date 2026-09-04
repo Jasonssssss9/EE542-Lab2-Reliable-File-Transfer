@@ -21,7 +21,7 @@ make test
 
 This creates `bin/client`, `bin/server`, and `bin/protocol_test`.
 
-## Stage 1 Usage
+## Usage
 
 Start the receiver first:
 
@@ -45,8 +45,13 @@ Verify the result externally:
 Both endpoints must use the same MTU. `--rate` is the fixed total DATA sending rate in
 Mbps; it is not selected automatically.
 
-## Current Limitations
+## Stage 2 Reliability
 
-Stage 1 is intended only for a zero-loss network. It has cumulative ACKs and a fixed
-sliding window, but no DATA retransmission, SACK bitmap, fast retransmit, RTO, RTT
-estimation, CRC32C, or internal MD5. Those belong to later stages.
+The receiver returns an 8192-bit SACK snapshot after each valid DATA packet. The sender
+combines cumulative ACK and SACK information, retransmits only missing chunks, uses a
+three-later-packet fast retransmit threshold, and falls back to a fixed 500 ms RTO. New and
+retransmitted DATA share the same Pacer and `--rate` budget.
+
+The current version still uses ACK-per-DATA rather than periodic ACKs. RTT estimation,
+adaptive RTO/rate control, automatic bandwidth estimation, CRC32C, and internal MD5 are
+not implemented; these are later optimization or optional features.

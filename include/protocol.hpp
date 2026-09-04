@@ -72,6 +72,7 @@ struct AckPayload {
     std::uint32_t largest_received_plus_one = 0;
     std::uint32_t bitmap_base = 0;
     std::uint16_t bitmap_bits = 0;
+    std::vector<std::uint8_t> bitmap;
 };
 
 struct CompleteAckPayload {

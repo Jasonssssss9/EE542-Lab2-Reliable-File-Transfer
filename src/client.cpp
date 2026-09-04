@@ -192,10 +192,12 @@ bool receive_expected(int socket_fd,
 
 void apply_ack_packet(const frft::Packet& packet, frft::SenderWindow& window) {
     frft::AckPayload ack;
-    if (!frft::deserialize_ack(packet.payload, ack) || ack.bitmap_bits != 0) {
+    if ((packet.header.flags & frft::FLAG_SACK) == 0 ||
+        !frft::deserialize_ack(packet.payload, ack) ||
+        ack.bitmap_bits != frft::kDefaultAckBitmapBits) {
         return;
     }
-    window.apply_cumulative_ack(ack.cumulative_ack);
+    window.process_ack(ack);
 }
 
 void drain_acks(int socket_fd,
@@ -237,11 +239,9 @@ void wait_for_ack(int socket_fd,
                   std::uint32_t session_id,
                   frft::SenderWindow& window) {
     frft::Packet packet;
-    if (!receive_expected(socket_fd, server, frft::PacketType::ACK, session_id, 5000, packet)) {
-        throw std::runtime_error(
-            "no cumulative ACK received; Stage 1 requires a zero-loss network");
+    if (receive_expected(socket_fd, server, frft::PacketType::ACK, session_id, 10, packet)) {
+        apply_ack_packet(packet, window);
     }
-    apply_ack_packet(packet, window);
 }
 
 std::uint32_t random_session_id() {
@@ -317,7 +317,8 @@ int run_client(const Options& options) {
             throw std::runtime_error("START handshake timed out after 10 attempts");
         }
         if (accepted.accepted_window_chunks == 0 ||
-            accepted.accepted_window_chunks > accepted.accepted_bitmap_bits) {
+            accepted.accepted_window_chunks > accepted.accepted_bitmap_bits ||
+            accepted.accepted_bitmap_bits != frft::kDefaultAckBitmapBits) {
             throw std::runtime_error("server accepted an invalid sliding window");
         }
 
@@ -325,20 +326,29 @@ int run_client(const Options& options) {
         const auto rate_bps = static_cast<std::uint64_t>(options.rate_mbps * 1'000'000.0);
         frft::Pacer pacer(rate_bps);
         std::uint64_t sent_data_packets = 0;
+        std::uint64_t retransmitted_packets = 0;
         bool sent_first_data = false;
         std::chrono::steady_clock::time_point first_data_time;
 
         while (!window.all_acked()) {
-            if (!window.can_send()) {
+            drain_acks(socket_fd, server, session_id, window);
+            window.check_timeouts(std::chrono::steady_clock::now(),
+                                  std::chrono::milliseconds(frft::kDefaultRtoMs));
+
+            const auto decision = window.select_next_packet();
+            if (!decision) {
                 wait_for_ack(socket_fd, server, session_id, window);
                 continue;
             }
 
-            const std::uint32_t sequence = window.take_next_sequence();
+            const std::uint32_t sequence = decision->sequence;
             const std::uint64_t offset = static_cast<std::uint64_t>(sequence) * chunk_size;
             const std::size_t payload_size = static_cast<std::size_t>(
                 std::min<std::uint64_t>(chunk_size, input.size() - offset));
-            const auto header = make_header(frft::PacketType::DATA, session_id, sequence);
+            auto header = make_header(frft::PacketType::DATA, session_id, sequence);
+            if (decision->retransmission) {
+                header.flags = frft::FLAG_RETRANSMITTED;
+            }
 
             pacer.wait_for_slot(frft::kIpv4UdpOverhead + frft::kHeaderSize + payload_size);
             if (!sent_first_data) {
@@ -346,7 +356,11 @@ int run_client(const Options& options) {
                 sent_first_data = true;
             }
             send_packet(socket_fd, server, header, input.data() + offset, payload_size);
+            window.mark_sent(sequence, std::chrono::steady_clock::now());
             ++sent_data_packets;
+            if (decision->retransmission) {
+                ++retransmitted_packets;
+            }
             drain_acks(socket_fd, server, session_id, window);
         }
 
@@ -389,6 +403,7 @@ int run_client(const Options& options) {
                   << "  session: " << session_id << '\n'
                   << "  file bytes: " << input.size() << '\n'
                   << "  DATA packets: " << sent_data_packets << '\n'
+                  << "  retransmitted DATA packets: " << retransmitted_packets << '\n'
                   << "  elapsed seconds: " << elapsed_seconds << '\n'
                   << "  client throughput Mbps: " << throughput_mbps << '\n'
                   << "  receiver data time us: " << completed.receiver_transfer_time_us << '\n';
