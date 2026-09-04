@@ -77,13 +77,20 @@ void SenderWindow::advance_base() {
 void SenderWindow::process_ack(const AckPayload& ack) {
     const std::uint32_t prefix_end =
         std::min({ack.cumulative_ack, total_chunks_, next_sequence_});
-    for (std::uint32_t sequence = 0; sequence < prefix_end; ++sequence) {
+    for (std::uint32_t sequence = base_; sequence < prefix_end; ++sequence) {
         mark_acked(sequence);
     }
 
     const std::size_t available_bits = std::min<std::size_t>(
         ack.bitmap_bits, ack.bitmap.size() * 8);
-    for (std::size_t bit = 0; bit < available_bits; ++bit) {
+    const std::uint64_t sequence_limit =
+        std::min<std::uint64_t>({ack.largest_received_plus_one, total_chunks_, next_sequence_});
+    const std::size_t bits_to_scan = ack.bitmap_base < sequence_limit
+                                         ? std::min<std::uint64_t>(
+                                               available_bits,
+                                               sequence_limit - ack.bitmap_base)
+                                         : 0;
+    for (std::size_t bit = 0; bit < bits_to_scan; ++bit) {
         if ((ack.bitmap[bit / 8] & (1U << (bit % 8))) == 0) {
             continue;
         }
@@ -190,11 +197,15 @@ AckPayload ReceiverTracker::make_ack_snapshot(std::uint16_t bitmap_bits) const {
     ack.bitmap_bits = bitmap_bits;
     ack.bitmap.assign((bitmap_bits + 7) / 8, 0);
 
-    for (std::uint32_t bit = 0; bit < bitmap_bits; ++bit) {
+    const std::uint64_t sequence_limit =
+        std::min<std::uint64_t>(largest_received_plus_one_, received_.size());
+    const std::size_t bits_to_scan = ack.bitmap_base < sequence_limit
+                                         ? std::min<std::uint64_t>(
+                                               bitmap_bits,
+                                               sequence_limit - ack.bitmap_base)
+                                         : 0;
+    for (std::size_t bit = 0; bit < bits_to_scan; ++bit) {
         const std::uint64_t sequence = static_cast<std::uint64_t>(ack.bitmap_base) + bit;
-        if (sequence >= received_.size()) {
-            break;
-        }
         if (received_[sequence] != 0) {
             ack.bitmap[bit / 8] |= static_cast<std::uint8_t>(1U << (bit % 8));
         }
