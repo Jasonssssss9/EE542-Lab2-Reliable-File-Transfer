@@ -21,8 +21,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-
-// stage 1 - server side down
 namespace {
 
 constexpr int kServerReceiveBufferBytes = 16 * 1024 * 1024;
