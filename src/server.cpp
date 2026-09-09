@@ -108,8 +108,11 @@ void send_packet(int socket_fd,
     }
 }
 
-bool receive_packet(int socket_fd, frft::Packet& packet, sockaddr_in& source, int flags = 0) {
-    std::vector<std::uint8_t> buffer(65535);
+bool receive_packet(int socket_fd,
+                    frft::Packet& packet,
+                    sockaddr_in& source,
+                    std::vector<std::uint8_t>& buffer,
+                    int flags = 0) {
     while (true) {
         socklen_t source_length = sizeof(source);
         const ssize_t received = recvfrom(socket_fd,
@@ -243,11 +246,12 @@ int run_server(const Options& options) {
 
         std::cout << "Waiting for one client on UDP port " << options.port << "\n";
 
+        std::vector<std::uint8_t> receive_buffer(65535);
         frft::Packet start_packet;
         sockaddr_in client {};
         frft::StartPayload start;
         while (true) {
-            receive_packet(socket_fd, start_packet, client);
+            receive_packet(socket_fd, start_packet, client, receive_buffer);
             if (start_packet.header.type != frft::PacketType::START ||
                 start_packet.header.session_id == 0 || start_packet.header.number != 0 ||
                 !frft::deserialize_start(start_packet.payload, start)) {
@@ -308,67 +312,28 @@ int run_server(const Options& options) {
                 continue;
             }
 
-            frft::Packet packet;
-            sockaddr_in source {};
-            if (!receive_packet(socket_fd, packet, source, MSG_DONTWAIT)) {
-                int timeout_ms = -1;
-                if (ack_dirty) {
-                    now = std::chrono::steady_clock::now();
-                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        next_ack_deadline - now);
-                    timeout_ms = std::max(1, static_cast<int>(remaining.count()));
-                }
-
-                pollfd descriptor {socket_fd, POLLIN, 0};
-                const int ready = poll(&descriptor, 1, timeout_ms);
-                if (ready < 0 && errno != EINTR) {
-                    throw std::runtime_error(std::string("poll failed: ") +
-                                             std::strerror(errno));
-                }
-                continue;
+            int timeout_ms = -1;
+            if (ack_dirty) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    next_ack_deadline - now);
+                timeout_ms = std::max(1, static_cast<int>(remaining.count()));
             }
 
-            if (packet.header.type == frft::PacketType::START) {
-                if (same_endpoint(source, client) && packet.header.session_id == session_id) {
-                    send_start_ack(socket_fd, client, session_id, accepted);
-                } else {
-                    const frft::StartAckPayload busy {frft::StatusCode::BUSY, 0, 0, 0};
-                    send_start_ack(socket_fd, source, packet.header.session_id, busy);
-                }
-                continue;
-            }
-            if (!same_endpoint(source, client) || packet.header.session_id != session_id) {
-                continue;
-            }
-
-            if (packet.header.type == frft::PacketType::DATA) {
-                const std::uint32_t sequence = packet.header.number;
-                if (sequence >= start.total_chunks) {
+            pollfd descriptor {socket_fd, POLLIN, 0};
+            const int ready = poll(&descriptor, 1, timeout_ms);
+            if (ready < 0) {
+                if (errno == EINTR) {
                     continue;
                 }
-                const std::uint64_t offset = static_cast<std::uint64_t>(sequence) * start.chunk_size;
-                const std::size_t expected_size = static_cast<std::size_t>(
-                    std::min<std::uint64_t>(start.chunk_size, start.file_size - offset));
-                if (packet.payload.size() != expected_size) {
-                    continue;
-                }
+                throw std::runtime_error(std::string("poll failed: ") + std::strerror(errno));
+            }
+            if (ready == 0) {
+                continue;
+            }
 
-                if (tracker.has_received(sequence)) {
-                    ++duplicate_packets;
-                } else {
-                    if (expected_size != 0) {
-                        std::memcpy(output->data() + offset, packet.payload.data(), expected_size);
-                    }
-                    tracker.mark_received(sequence);
-                    now = std::chrono::steady_clock::now();
-                    if (!received_first_data) {
-                        first_data_time = now;
-                        received_first_data = true;
-                    }
-                    last_data_time = now;
-                }
+            while (true) {
                 now = std::chrono::steady_clock::now();
-                if (tracker.complete()) {
+                if (ack_dirty && now >= next_ack_deadline) {
                     send_ack(socket_fd,
                              client,
                              session_id,
@@ -376,70 +341,132 @@ int run_server(const Options& options) {
                              tracker,
                              accepted.accepted_bitmap_bits);
                     ack_dirty = false;
-                } else {
-                    if (!ack_dirty) {
-                        next_ack_deadline = now + ack_interval;
-                    }
-                    ack_dirty = true;
                 }
-                continue;
+
+                frft::Packet packet;
+                sockaddr_in source {};
+                if (!receive_packet(
+                        socket_fd, packet, source, receive_buffer, MSG_DONTWAIT)) {
+                    break;
+                }
+
+                if (packet.header.type == frft::PacketType::START) {
+                    if (same_endpoint(source, client) && packet.header.session_id == session_id) {
+                        send_start_ack(socket_fd, client, session_id, accepted);
+                    } else {
+                        const frft::StartAckPayload busy {frft::StatusCode::BUSY, 0, 0, 0};
+                        send_start_ack(socket_fd, source, packet.header.session_id, busy);
+                    }
+                    continue;
+                }
+                if (!same_endpoint(source, client) || packet.header.session_id != session_id) {
+                    continue;
+                }
+
+                if (packet.header.type == frft::PacketType::DATA) {
+                    const std::uint32_t sequence = packet.header.number;
+                    if (sequence >= start.total_chunks) {
+                        continue;
+                    }
+                    const std::uint64_t offset =
+                        static_cast<std::uint64_t>(sequence) * start.chunk_size;
+                    const std::size_t expected_size = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(start.chunk_size, start.file_size - offset));
+                    if (packet.payload.size() != expected_size) {
+                        continue;
+                    }
+
+                    const bool duplicate = tracker.has_received(sequence);
+                    if (duplicate) {
+                        ++duplicate_packets;
+                    } else {
+                        if (expected_size != 0) {
+                            std::memcpy(
+                                output->data() + offset, packet.payload.data(), expected_size);
+                        }
+                        tracker.mark_received(sequence);
+                    }
+                    now = std::chrono::steady_clock::now();
+                    if (!duplicate) {
+                        if (!received_first_data) {
+                            first_data_time = now;
+                            received_first_data = true;
+                        }
+                        last_data_time = now;
+                    }
+                    if (tracker.complete()) {
+                        send_ack(socket_fd,
+                                 client,
+                                 session_id,
+                                 ack_number++,
+                                 tracker,
+                                 accepted.accepted_bitmap_bits);
+                        ack_dirty = false;
+                    } else {
+                        if (!ack_dirty) {
+                            next_ack_deadline = now + ack_interval;
+                        }
+                        ack_dirty = true;
+                    }
+                    continue;
+                }
+
+                if (packet.header.type != frft::PacketType::COMPLETE ||
+                    packet.header.number != start.total_chunks || !packet.payload.empty()) {
+                    continue;
+                }
+                if (!tracker.complete() || tracker.cumulative_ack() != start.total_chunks) {
+                    send_ack(socket_fd,
+                             client,
+                             session_id,
+                             ack_number++,
+                             tracker,
+                             accepted.accepted_bitmap_bits);
+                    ack_dirty = false;
+                    continue;
+                }
+
+                output->sync();
+                const std::uint64_t receiver_time_us = received_first_data
+                                                           ? std::chrono::duration_cast<
+                                                                 std::chrono::microseconds>(
+                                                                 last_data_time - first_data_time)
+                                                                 .count()
+                                                           : 0;
+                const frft::CompleteAckPayload completed {
+                    frft::StatusCode::OK,
+                    tracker.received_count(),
+                    start.file_size,
+                    receiver_time_us,
+                };
+                const auto complete_payload = frft::serialize_complete_ack(completed);
+                const auto complete_header =
+                    make_header(frft::PacketType::COMPLETE_ACK, session_id, start.total_chunks);
+                send_packet(socket_fd,
+                            client,
+                            complete_header,
+                            complete_payload.data(),
+                            complete_payload.size());
+
+                const double seconds = receiver_time_us / 1'000'000.0;
+                const double throughput_mbps =
+                    seconds > 0.0 ? start.file_size * 8.0 / seconds / 1'000'000.0 : 0.0;
+                std::cout << "Transfer complete\n"
+                          << "  session: " << session_id << '\n'
+                          << "  file bytes: " << start.file_size << '\n'
+                          << "  unique chunks: " << tracker.received_count() << '\n'
+                          << "  duplicate DATA packets: " << duplicate_packets << '\n'
+                          << "  receiver data time us: " << receiver_time_us << '\n'
+                          << "  receiver throughput Mbps: " << throughput_mbps << '\n';
+
+                time_wait(socket_fd,
+                          client,
+                          session_id,
+                          start.total_chunks,
+                          complete_payload);
+                close(socket_fd);
+                return 0;
             }
-
-            if (packet.header.type != frft::PacketType::COMPLETE ||
-                packet.header.number != start.total_chunks || !packet.payload.empty()) {
-                continue;
-            }
-            if (!tracker.complete() || tracker.cumulative_ack() != start.total_chunks) {
-                send_ack(socket_fd,
-                         client,
-                         session_id,
-                         ack_number++,
-                         tracker,
-                         accepted.accepted_bitmap_bits);
-                ack_dirty = false;
-                continue;
-            }
-
-            output->sync();
-            const std::uint64_t receiver_time_us = received_first_data
-                                                       ? std::chrono::duration_cast<
-                                                             std::chrono::microseconds>(
-                                                             last_data_time - first_data_time)
-                                                             .count()
-                                                       : 0;
-            const frft::CompleteAckPayload completed {
-                frft::StatusCode::OK,
-                tracker.received_count(),
-                start.file_size,
-                receiver_time_us,
-            };
-            const auto complete_payload = frft::serialize_complete_ack(completed);
-            const auto complete_header =
-                make_header(frft::PacketType::COMPLETE_ACK, session_id, start.total_chunks);
-            send_packet(socket_fd,
-                        client,
-                        complete_header,
-                        complete_payload.data(),
-                        complete_payload.size());
-
-            const double seconds = receiver_time_us / 1'000'000.0;
-            const double throughput_mbps =
-                seconds > 0.0 ? start.file_size * 8.0 / seconds / 1'000'000.0 : 0.0;
-            std::cout << "Transfer complete\n"
-                      << "  session: " << session_id << '\n'
-                      << "  file bytes: " << start.file_size << '\n'
-                      << "  unique chunks: " << tracker.received_count() << '\n'
-                      << "  duplicate DATA packets: " << duplicate_packets << '\n'
-                      << "  receiver data time us: " << receiver_time_us << '\n'
-                      << "  receiver throughput Mbps: " << throughput_mbps << '\n';
-
-            time_wait(socket_fd,
-                      client,
-                      session_id,
-                      start.total_chunks,
-                      complete_payload);
-            close(socket_fd);
-            return 0;
         }
     } catch (...) {
         close(socket_fd);
