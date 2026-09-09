@@ -23,6 +23,8 @@
 
 namespace {
 
+constexpr int kServerReceiveBufferBytes = 16 * 1024 * 1024;
+
 struct Options {
     std::string output;
     std::uint16_t port = 0;
@@ -106,19 +108,23 @@ void send_packet(int socket_fd,
     }
 }
 
-bool receive_packet(int socket_fd, frft::Packet& packet, sockaddr_in& source) {
+bool receive_packet(int socket_fd, frft::Packet& packet, sockaddr_in& source, int flags = 0) {
     std::vector<std::uint8_t> buffer(65535);
     while (true) {
         socklen_t source_length = sizeof(source);
         const ssize_t received = recvfrom(socket_fd,
                                           buffer.data(),
                                           buffer.size(),
-                                          0,
+                                          flags,
                                           reinterpret_cast<sockaddr*>(&source),
                                           &source_length);
         if (received < 0) {
             if (errno == EINTR) {
                 continue;
+            }
+            if ((flags & MSG_DONTWAIT) != 0 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return false;
             }
             throw std::runtime_error(std::string("recvfrom failed: ") + std::strerror(errno));
         }
@@ -218,6 +224,14 @@ int run_server(const Options& options) {
     try {
         const int reuse = 1;
         setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (setsockopt(socket_fd,
+                       SOL_SOCKET,
+                       SO_RCVBUF,
+                       &kServerReceiveBufferBytes,
+                       sizeof(kServerReceiveBufferBytes)) != 0) {
+            throw std::runtime_error(std::string("cannot increase UDP receive buffer: ") +
+                                     std::strerror(errno));
+        }
 
         sockaddr_in local {};
         local.sin_family = AF_INET;
@@ -276,11 +290,43 @@ int run_server(const Options& options) {
         bool received_first_data = false;
         std::chrono::steady_clock::time_point first_data_time;
         std::chrono::steady_clock::time_point last_data_time;
+        const auto ack_interval =
+            std::chrono::milliseconds(accepted.accepted_ack_interval_ms);
+        bool ack_dirty = false;
+        std::chrono::steady_clock::time_point next_ack_deadline;
 
         while (true) {
+            auto now = std::chrono::steady_clock::now();
+            if (ack_dirty && now >= next_ack_deadline) {
+                send_ack(socket_fd,
+                         client,
+                         session_id,
+                         ack_number++,
+                         tracker,
+                         accepted.accepted_bitmap_bits);
+                ack_dirty = false;
+                continue;
+            }
+
             frft::Packet packet;
             sockaddr_in source {};
-            receive_packet(socket_fd, packet, source);
+            if (!receive_packet(socket_fd, packet, source, MSG_DONTWAIT)) {
+                int timeout_ms = -1;
+                if (ack_dirty) {
+                    now = std::chrono::steady_clock::now();
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        next_ack_deadline - now);
+                    timeout_ms = std::max(1, static_cast<int>(remaining.count()));
+                }
+
+                pollfd descriptor {socket_fd, POLLIN, 0};
+                const int ready = poll(&descriptor, 1, timeout_ms);
+                if (ready < 0 && errno != EINTR) {
+                    throw std::runtime_error(std::string("poll failed: ") +
+                                             std::strerror(errno));
+                }
+                continue;
+            }
 
             if (packet.header.type == frft::PacketType::START) {
                 if (same_endpoint(source, client) && packet.header.session_id == session_id) {
@@ -314,19 +360,28 @@ int run_server(const Options& options) {
                         std::memcpy(output->data() + offset, packet.payload.data(), expected_size);
                     }
                     tracker.mark_received(sequence);
-                    const auto now = std::chrono::steady_clock::now();
+                    now = std::chrono::steady_clock::now();
                     if (!received_first_data) {
                         first_data_time = now;
                         received_first_data = true;
                     }
                     last_data_time = now;
                 }
-                send_ack(socket_fd,
-                         client,
-                         session_id,
-                         ack_number++,
-                         tracker,
-                         accepted.accepted_bitmap_bits);
+                now = std::chrono::steady_clock::now();
+                if (tracker.complete()) {
+                    send_ack(socket_fd,
+                             client,
+                             session_id,
+                             ack_number++,
+                             tracker,
+                             accepted.accepted_bitmap_bits);
+                    ack_dirty = false;
+                } else {
+                    if (!ack_dirty) {
+                        next_ack_deadline = now + ack_interval;
+                    }
+                    ack_dirty = true;
+                }
                 continue;
             }
 
@@ -341,6 +396,7 @@ int run_server(const Options& options) {
                          ack_number++,
                          tracker,
                          accepted.accepted_bitmap_bits);
+                ack_dirty = false;
                 continue;
             }
 
