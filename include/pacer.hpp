@@ -14,8 +14,13 @@ public:
     void reset();
 
 private:
-    std::uint64_t rate_bits_per_second_;
-    std::chrono::steady_clock::time_point next_send_time_;
+    using Clock = std::chrono::steady_clock;
+
+    void refill(Clock::time_point now, long double capacity_bytes);
+
+    long double bytes_per_nanosecond_;
+    long double tokens_bytes_;
+    Clock::time_point last_refill_time_;
 };
 
 }  // namespace frft
