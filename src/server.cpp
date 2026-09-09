@@ -284,6 +284,20 @@ int run_server(const Options& options) {
         send_start_ack(socket_fd, client, session_id, accepted);
 
         frft::ReceiverTracker tracker(start.total_chunks);
+
+        /*ack interval*/
+        const auto ack_interval = std::chrono::milliseconds(
+        std::max<std::uint16_t>(
+            1,
+            accepted.accepted_ack_interval_ms));
+
+        bool ack_pending = false;
+        std::uint32_t packets_since_ack = 0;
+
+        auto next_ack_time = std::chrono::steady_clock::now() + ack_interval;
+        constexpr std::uint32_t kAckPacketThreshold = 32;
+        /*ack interval*/
+
         std::uint32_t ack_number = 0;
         std::uint64_t duplicate_packets = 0;
         bool received_first_data = false;
@@ -335,12 +349,46 @@ int run_server(const Options& options) {
                     }
                     last_data_time = now;
                 }
-                send_ack(socket_fd,
-                         client,
-                         session_id,
-                         ack_number++,
-                         tracker,
-                         accepted.accepted_bitmap_bits);
+                // send_ack(socket_fd,
+                //          client,
+                //          session_id,
+                //          ack_number++,
+                //          tracker,
+                //          accepted.accepted_bitmap_bits);
+                // continue;
+
+                ++packets_since_ack;
+
+                const auto now = std::chrono::steady_clock::now();
+
+                if (!ack_pending) {
+                    ack_pending = true;
+                    next_ack_time = now + ack_interval;
+                }
+
+                const bool retransmitted =
+                    (packet.header.flags &
+                    frft::FLAG_RETRANSMITTED) != 0;
+
+                const bool should_send_ack =
+                    duplicate ||
+                    retransmitted ||
+                    tracker.complete() ||
+                    packets_since_ack >= kAckPacketThreshold ||
+                    now >= next_ack_time;
+
+                if (should_send_ack) {
+                    send_ack(socket_fd,
+                            client,
+                            session_id,
+                            ack_number++,
+                            tracker,
+                            accepted.accepted_bitmap_bits);
+
+                    ack_pending = false;
+                    packets_since_ack = 0;
+                }
+
                 continue;
             }
 
