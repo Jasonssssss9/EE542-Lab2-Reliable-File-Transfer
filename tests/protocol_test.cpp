@@ -163,7 +163,7 @@ void test_receiver_sack_and_gap_filling() {
 
 void test_sender_ack_processing_and_window() {
     const auto sent_time = std::chrono::steady_clock::time_point {};
-    frft::SenderWindow sender(5, 2);
+    frft::SenderWindow sender(5, 2, 8);
     send_initial_chunks(sender, 2, sent_time);
     check(!sender.select_next_packet(), "sender stops at the fixed window edge");
 
@@ -183,7 +183,7 @@ void test_sender_ack_processing_and_window() {
 
 void test_fast_retransmit() {
     const auto sent_time = std::chrono::steady_clock::time_point {};
-    frft::SenderWindow sender(105, 105);
+    frft::SenderWindow sender(105, 105, 8192);
     send_initial_chunks(sender, 104, sent_time);
 
     frft::AckPayload ack {100, 104, 100, 8, std::vector<std::uint8_t>(1, 0)};
@@ -204,7 +204,7 @@ void test_fast_retransmit() {
 
 void test_repeated_fast_retransmit_requires_new_sack_evidence() {
     const auto sent_time = std::chrono::steady_clock::now();
-    frft::SenderWindow sender(115, 115);
+    frft::SenderWindow sender(115, 115, 8192);
     send_initial_chunks(sender, 115, sent_time);
 
     frft::AckPayload first_gap_ack {100, 104, 100, 16, std::vector<std::uint8_t>(2, 0)};
@@ -270,7 +270,7 @@ void test_repeated_fast_retransmit_requires_new_sack_evidence() {
 
 void test_duplicate_and_reordered_ack_safety() {
     const auto sent_time = std::chrono::steady_clock::time_point {};
-    frft::SenderWindow sender(8, 8);
+    frft::SenderWindow sender(8, 8, 8192);
     send_initial_chunks(sender, 6, sent_time);
 
     frft::AckPayload newer {2, 6, 2, 8, std::vector<std::uint8_t>(1, 0)};
@@ -287,7 +287,7 @@ void test_duplicate_and_reordered_ack_safety() {
 
 void test_rto_and_completion() {
     const auto sent_time = std::chrono::steady_clock::time_point {};
-    frft::SenderWindow sender(2, 2);
+    frft::SenderWindow sender(2, 2, 8192);
     send_initial_chunks(sender, 2, sent_time);
 
     frft::AckPayload ack {0, 2, 0, 8, std::vector<std::uint8_t>(1, 0)};
@@ -309,6 +309,137 @@ void test_rto_and_completion() {
     check(sender.all_acked(), "sender completes only after every chunk is ACKed");
 }
 
+void test_sack_releases_logical_window_capacity() {
+    const auto sent_time = std::chrono::steady_clock::time_point {};
+    frft::SenderWindow sender(12, 4, 6);
+    send_initial_chunks(sender, 4, sent_time);
+    check(sender.outstanding_chunks() == 4,
+          "first transmissions consume logical window capacity");
+    check(!sender.select_next_packet(), "logical outstanding limit blocks new DATA");
+
+    frft::AckPayload sack {0, 4, 0, 6, std::vector<std::uint8_t>(1, 0)};
+    set_ack_bit(sack, 1);
+    set_ack_bit(sack, 2);
+    set_ack_bit(sack, 3);
+    sender.process_ack(sack, sent_time + std::chrono::milliseconds(10));
+    check(sender.outstanding_chunks() == 1,
+          "SACKed chunks release logical window capacity behind a hole");
+    sender.process_ack(sack, sent_time + std::chrono::milliseconds(11));
+    check(sender.outstanding_chunks() == 1,
+          "duplicate SACK does not release logical capacity twice");
+
+    const auto retransmission = sender.select_next_packet();
+    check(retransmission && retransmission->retransmission &&
+              retransmission->sequence == 0,
+          "gap retransmission remains ahead of new DATA");
+    check(sender.outstanding_chunks() == 1,
+          "retransmission does not consume new logical capacity");
+    sender.mark_sent(0, sent_time + std::chrono::milliseconds(12));
+
+    for (std::uint32_t sequence = 4; sequence < 6; ++sequence) {
+        const auto decision = sender.select_next_packet();
+        check(decision && !decision->retransmission && decision->sequence == sequence,
+              "released logical capacity admits later new DATA");
+        if (decision) {
+            sender.mark_sent(decision->sequence, sent_time);
+        }
+    }
+    check(sender.outstanding_chunks() == 3,
+          "only unacknowledged first transmissions occupy logical capacity");
+    check(!sender.select_next_packet(),
+          "SACK coverage still bounds sequence span after capacity is released");
+    check(sender.next_sequence() - sender.base() == 6,
+          "sequence span reaches but does not exceed SACK coverage");
+
+    frft::AckPayload prefix {4, 6, 4, 6, std::vector<std::uint8_t>(1, 0)};
+    sender.process_ack(prefix, sent_time + std::chrono::milliseconds(20));
+    check(sender.base() == 4 && sender.outstanding_chunks() == 2,
+          "cumulative ACK retires the hole without double-counting prior SACKs");
+    const auto next = sender.select_next_packet();
+    check(next && !next->retransmission && next->sequence == 6,
+          "base advancement reopens SACK sequence coverage");
+}
+
+void test_sender_stays_within_full_sack_coverage() {
+    const auto sent_time = std::chrono::steady_clock::time_point {};
+    constexpr std::uint32_t logical_window = 5794;
+    constexpr std::uint32_t sack_coverage = 8192;
+    frft::SenderWindow sender(9000, logical_window, sack_coverage);
+    send_initial_chunks(sender, logical_window, sent_time);
+
+    frft::AckPayload sack {
+        0,
+        logical_window,
+        0,
+        static_cast<std::uint16_t>(sack_coverage),
+        std::vector<std::uint8_t>(sack_coverage / 8, 0),
+    };
+    for (std::uint32_t bit = 1; bit < logical_window; ++bit) {
+        set_ack_bit(sack, bit);
+    }
+    sender.process_ack(sack, sent_time + std::chrono::milliseconds(10));
+    check(sender.outstanding_chunks() == 1,
+          "large SACK run releases all acknowledged logical slots");
+
+    const auto retransmission = sender.select_next_packet();
+    check(retransmission && retransmission->retransmission &&
+              retransmission->sequence == 0,
+          "coverage-limit test retains missing-prefix retransmission");
+    check(sender.outstanding_chunks() == 1,
+          "coverage-limit retransmission leaves outstanding count unchanged");
+    sender.mark_sent(0, sent_time + std::chrono::milliseconds(11));
+
+    for (std::uint32_t sequence = logical_window; sequence < sack_coverage; ++sequence) {
+        const auto decision = sender.select_next_packet();
+        check(decision && !decision->retransmission && decision->sequence == sequence,
+              "sender uses available SACK coverage");
+        if (!decision) {
+            break;
+        }
+        sender.mark_sent(decision->sequence, sent_time);
+    }
+    check(sender.next_sequence() - sender.base() == sack_coverage,
+          "sender may use the full negotiated SACK span");
+    check(!sender.select_next_packet(),
+          "sender cannot issue a sequence beyond negotiated SACK coverage");
+
+    const std::uint32_t outstanding_before_duplicate = sender.outstanding_chunks();
+    sender.process_ack(sack, sent_time + std::chrono::milliseconds(12));
+    check(sender.outstanding_chunks() == outstanding_before_duplicate,
+          "repeated full-size SACK is idempotent");
+
+    frft::AckPayload repaired {
+        logical_window,
+        sack_coverage,
+        logical_window,
+        static_cast<std::uint16_t>(sack_coverage),
+        std::vector<std::uint8_t>(sack_coverage / 8, 0),
+    };
+    sender.process_ack(repaired, sent_time + std::chrono::milliseconds(20));
+    check(sender.base() == logical_window,
+          "repairing the leading hole advances the cumulative base");
+    const auto next = sender.select_next_packet();
+    check(next && !next->retransmission && next->sequence == sack_coverage,
+          "new DATA resumes only after coverage moves forward");
+}
+
+void test_mtu_window_calculations() {
+    const auto window_chunks = [](std::uint32_t chunk_size) {
+        return static_cast<std::uint32_t>(
+            (frft::kDefaultWindowBytes + chunk_size - 1) / chunk_size);
+    };
+
+    const std::uint32_t mtu1500_chunk = frft::chunk_size_for_mtu(1500);
+    const std::uint32_t jumbo_chunk = frft::chunk_size_for_mtu(9001);
+    check(mtu1500_chunk == 1448 && window_chunks(mtu1500_chunk) == 5794,
+          "MTU 1500 uses a 5794-chunk logical window");
+    check(jumbo_chunk == 8949 && window_chunks(jumbo_chunk) == 938,
+          "MTU 9001 uses a 938-chunk logical window");
+    check(window_chunks(mtu1500_chunk) <= frft::kDefaultAckBitmapBits &&
+              window_chunks(jumbo_chunk) <= frft::kDefaultAckBitmapBits,
+          "both supported MTUs keep logical capacity within SACK coverage");
+}
+
 }  // namespace
 
 int main() {
@@ -320,6 +451,9 @@ int main() {
     test_repeated_fast_retransmit_requires_new_sack_evidence();
     test_duplicate_and_reordered_ack_safety();
     test_rto_and_completion();
+    test_sack_releases_logical_window_capacity();
+    test_sender_stays_within_full_sack_coverage();
+    test_mtu_window_calculations();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

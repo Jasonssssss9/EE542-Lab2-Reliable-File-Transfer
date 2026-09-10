@@ -485,7 +485,9 @@ int run_client(const Options& options) {
             throw std::runtime_error("server accepted an invalid sliding window");
         }
 
-        frft::SenderWindow window(total_chunks, accepted.accepted_window_chunks);
+        frft::SenderWindow window(total_chunks,
+                                  accepted.accepted_window_chunks,
+                                  accepted.accepted_bitmap_bits);
         const auto rate_bps = static_cast<std::uint64_t>(options.rate_mbps * 1'000'000.0);
         frft::Pacer pacer(rate_bps);
         std::uint64_t sent_data_packets = 0;
@@ -517,9 +519,10 @@ int run_client(const Options& options) {
                 const auto idle_start = std::chrono::steady_clock::now();
                 diagnostics.begin_no_send(idle_start);
                 const bool window_blocked =
+                    window.outstanding_chunks() >= accepted.accepted_window_chunks ||
                     static_cast<std::uint64_t>(window.next_sequence()) >=
                     static_cast<std::uint64_t>(window.base()) +
-                        accepted.accepted_window_chunks;
+                        accepted.accepted_bitmap_bits;
                 const bool all_data_issued = window.next_sequence() >= total_chunks;
 
                 wait_for_ack(socket_fd,

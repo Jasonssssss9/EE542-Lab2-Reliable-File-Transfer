@@ -12,20 +12,30 @@ constexpr auto kRepeatedFastRetransmitDelay =
 
 }  // namespace
 
-SenderWindow::SenderWindow(std::uint32_t total_chunks, std::uint32_t window_chunks)
+SenderWindow::SenderWindow(std::uint32_t total_chunks,
+                           std::uint32_t logical_window_chunks,
+                           std::uint32_t sack_coverage_chunks)
     : total_chunks_(total_chunks),
-      window_chunks_(window_chunks),
+      logical_window_chunks_(logical_window_chunks),
+      sack_coverage_chunks_(sack_coverage_chunks),
       chunks_(total_chunks),
       last_base_advance_time_(std::chrono::steady_clock::now()) {
-    if (window_chunks == 0) {
+    if (logical_window_chunks == 0) {
         throw std::invalid_argument("window must contain at least one chunk");
+    }
+    if (sack_coverage_chunks == 0) {
+        throw std::invalid_argument("SACK coverage must contain at least one chunk");
+    }
+    if (logical_window_chunks > sack_coverage_chunks) {
+        throw std::invalid_argument("logical window cannot exceed SACK coverage");
     }
 }
 
 bool SenderWindow::can_send_new() const {
     return next_sequence_ < total_chunks_ &&
+           outstanding_chunks_ < logical_window_chunks_ &&
            static_cast<std::uint64_t>(next_sequence_) <
-               static_cast<std::uint64_t>(base_) + window_chunks_;
+               static_cast<std::uint64_t>(base_) + sack_coverage_chunks_;
 }
 
 std::optional<SendDecision> SenderWindow::select_next_packet() {
@@ -44,7 +54,9 @@ std::optional<SendDecision> SenderWindow::select_next_packet() {
     }
 
     if (can_send_new()) {
-        return SendDecision {next_sequence_++, false, false};
+        const std::uint32_t sequence = next_sequence_++;
+        ++outstanding_chunks_;
+        return SendDecision {sequence, false, false};
     }
     return std::nullopt;
 }
@@ -62,9 +74,13 @@ void SenderWindow::mark_acked(std::uint32_t sequence) {
     if (sequence >= next_sequence_ || sequence >= total_chunks_) {
         return;
     }
+    if (chunks_[sequence].state == PacketState::ACKED) {
+        return;
+    }
     chunks_[sequence].state = PacketState::ACKED;
     chunks_[sequence].retransmit_pending = false;
     chunks_[sequence].fast_retransmit_pending = false;
+    --outstanding_chunks_;
 }
 
 void SenderWindow::queue_retransmission(std::uint32_t sequence, bool fast_retransmit) {
@@ -168,6 +184,10 @@ std::uint32_t SenderWindow::base() const {
 
 std::uint32_t SenderWindow::next_sequence() const {
     return next_sequence_;
+}
+
+std::uint32_t SenderWindow::outstanding_chunks() const {
+    return outstanding_chunks_;
 }
 
 PacketState SenderWindow::state(std::uint32_t sequence) const {

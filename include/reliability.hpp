@@ -24,7 +24,9 @@ struct SendDecision {
 
 class SenderWindow {
 public:
-    SenderWindow(std::uint32_t total_chunks, std::uint32_t window_chunks);
+    SenderWindow(std::uint32_t total_chunks,
+                 std::uint32_t logical_window_chunks,
+                 std::uint32_t sack_coverage_chunks);
 
     std::optional<SendDecision> select_next_packet();
     void mark_sent(std::uint32_t sequence,
@@ -38,6 +40,7 @@ public:
     bool all_acked() const;
     std::uint32_t base() const;
     std::uint32_t next_sequence() const;
+    std::uint32_t outstanding_chunks() const;
     PacketState state(std::uint32_t sequence) const;
     bool retransmit_pending(std::uint32_t sequence) const;
     std::uint64_t base_advancement_events() const;
@@ -61,9 +64,11 @@ private:
     void advance_base(std::chrono::steady_clock::time_point now);
 
     std::uint32_t total_chunks_;
-    std::uint32_t window_chunks_;
+    std::uint32_t logical_window_chunks_;
+    std::uint32_t sack_coverage_chunks_;
     std::uint32_t base_ = 0;
     std::uint32_t next_sequence_ = 0;
+    std::uint32_t outstanding_chunks_ = 0;
     std::vector<ChunkState> chunks_;
     std::deque<std::uint32_t> retransmission_queue_;
     std::chrono::steady_clock::time_point last_base_advance_time_;
