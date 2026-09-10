@@ -19,6 +19,7 @@ enum class PacketState {
 struct SendDecision {
     std::uint32_t sequence;
     bool retransmission;
+    bool fast_retransmission;
 };
 
 class SenderWindow {
@@ -37,12 +38,16 @@ public:
     std::uint32_t next_sequence() const;
     PacketState state(std::uint32_t sequence) const;
     bool retransmit_pending(std::uint32_t sequence) const;
+    std::uint64_t base_advancement_events() const;
+    std::chrono::nanoseconds total_base_stall_time() const;
+    std::chrono::nanoseconds longest_base_stall_time() const;
 
 private:
     struct ChunkState {
         PacketState state = PacketState::UNSENT;
         std::chrono::steady_clock::time_point last_sent_time {};
         bool retransmit_pending = false;
+        bool fast_retransmit_pending = false;
         bool fast_retransmitted = false;
     };
 
@@ -57,6 +62,10 @@ private:
     std::uint32_t next_sequence_ = 0;
     std::vector<ChunkState> chunks_;
     std::deque<std::uint32_t> retransmission_queue_;
+    std::chrono::steady_clock::time_point last_base_advance_time_;
+    std::uint64_t base_advancement_events_ = 0;
+    std::chrono::nanoseconds total_base_stall_time_ {0};
+    std::chrono::nanoseconds longest_base_stall_time_ {0};
 };
 
 class ReceiverTracker {

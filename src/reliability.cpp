@@ -9,7 +9,8 @@ namespace frft {
 SenderWindow::SenderWindow(std::uint32_t total_chunks, std::uint32_t window_chunks)
     : total_chunks_(total_chunks),
       window_chunks_(window_chunks),
-      chunks_(total_chunks) {
+      chunks_(total_chunks),
+      last_base_advance_time_(std::chrono::steady_clock::now()) {
     if (window_chunks == 0) {
         throw std::invalid_argument("window must contain at least one chunk");
     }
@@ -28,13 +29,15 @@ std::optional<SendDecision> SenderWindow::select_next_packet() {
         ChunkState& chunk = chunks_[sequence];
         if (chunk.state == PacketState::IN_FLIGHT && chunk.retransmit_pending) {
             chunk.retransmit_pending = false;
+            const bool fast_retransmission = chunk.fast_retransmit_pending;
+            chunk.fast_retransmit_pending = false;
             chunk.fast_retransmitted = true;
-            return SendDecision {sequence, true};
+            return SendDecision {sequence, true, fast_retransmission};
         }
     }
 
     if (can_send_new()) {
-        return SendDecision {next_sequence_++, false};
+        return SendDecision {next_sequence_++, false, false};
     }
     return std::nullopt;
 }
@@ -54,6 +57,7 @@ void SenderWindow::mark_acked(std::uint32_t sequence) {
     }
     chunks_[sequence].state = PacketState::ACKED;
     chunks_[sequence].retransmit_pending = false;
+    chunks_[sequence].fast_retransmit_pending = false;
 }
 
 void SenderWindow::queue_retransmission(std::uint32_t sequence, bool fast_retransmit) {
@@ -62,6 +66,7 @@ void SenderWindow::queue_retransmission(std::uint32_t sequence, bool fast_retran
         return;
     }
     chunk.retransmit_pending = true;
+    chunk.fast_retransmit_pending = fast_retransmit;
     if (fast_retransmit) {
         chunk.fast_retransmitted = true;
     }
@@ -69,8 +74,18 @@ void SenderWindow::queue_retransmission(std::uint32_t sequence, bool fast_retran
 }
 
 void SenderWindow::advance_base() {
+    const std::uint32_t previous_base = base_;
     while (base_ < total_chunks_ && chunks_[base_].state == PacketState::ACKED) {
         ++base_;
+    }
+    if (base_ != previous_base) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto stall_time =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_base_advance_time_);
+        total_base_stall_time_ += stall_time;
+        longest_base_stall_time_ = std::max(longest_base_stall_time_, stall_time);
+        last_base_advance_time_ = now;
+        ++base_advancement_events_;
     }
 }
 
@@ -151,6 +166,18 @@ bool SenderWindow::retransmit_pending(std::uint32_t sequence) const {
         return false;
     }
     return chunks_[sequence].retransmit_pending;
+}
+
+std::uint64_t SenderWindow::base_advancement_events() const {
+    return base_advancement_events_;
+}
+
+std::chrono::nanoseconds SenderWindow::total_base_stall_time() const {
+    return total_base_stall_time_;
+}
+
+std::chrono::nanoseconds SenderWindow::longest_base_stall_time() const {
+    return longest_base_stall_time_;
 }
 
 ReceiverTracker::ReceiverTracker(std::uint32_t total_chunks) : received_(total_chunks, 0) {}
