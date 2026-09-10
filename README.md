@@ -51,6 +51,30 @@ The scripts are intentionally local-only: run Client commands on the Client VM, 
 commands on the Server VM, and router commands from the Linux shell on the VyOS VM. No
 SSH orchestration is used. Client means Sender, and Server means Receiver.
 
+### Test Topology
+
+```text
+Client/Sender 192.168.20.100
+        |
+VyOS eth2 192.168.20.1
+VyOS eth1 192.168.10.1
+        |
+Server/Receiver 192.168.10.100
+```
+
+### Mandatory Cases
+
+| Case | Expected RTT | Router netem on each egress | Client/Server rate | Router rate |
+| --- | --- | --- | --- | --- |
+| 1 | about 10 ms | 5 ms delay, 1% loss | 100 Mbps | 100 Mbps |
+| 2 | about 200 ms | 100 ms delay, 20% loss | 100 Mbps | 100 Mbps |
+| 3 | about 200 ms | 100 ms delay, no configured loss | 100 Mbps | 80 Mbps |
+
+Test every mandatory case with both:
+
+- MTU 1500
+- MTU 9001
+
 ### Script Usage
 
 #### `setup_case.sh`
@@ -94,30 +118,6 @@ Compares two files available on the same local VM.
 ```bash
 ./scripts/verify_md5.sh <original_file> <received_file>
 ```
-
-### Test Topology
-
-```text
-Client/Sender 192.168.20.100
-        |
-VyOS eth2 192.168.20.1
-VyOS eth1 192.168.10.1
-        |
-Server/Receiver 192.168.10.100
-```
-
-### Mandatory Cases
-
-| Case | Expected RTT | Router netem on each egress | Client/Server rate | Router rate |
-| --- | --- | --- | --- | --- |
-| 1 | about 10 ms | 5 ms delay, 1% loss | 100 Mbps | 100 Mbps |
-| 2 | about 200 ms | 100 ms delay, 20% loss | 100 Mbps | 100 Mbps |
-| 3 | about 200 ms | 100 ms delay, no configured loss | 100 Mbps | 80 Mbps |
-
-Test every mandatory case with both:
-
-- MTU 1500
-- MTU 9001
 
 ### Complete Example: Case 3, MTU 1500
 
