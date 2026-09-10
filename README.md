@@ -47,11 +47,55 @@ Mbps; it is not selected automatically.
 
 ## Experiment Scripts
 
-The experiment scripts are intentionally local-only. Run Client commands on the Client
-VM, Server commands on the Server VM, and router commands from the Linux shell on the
-VyOS VM. The scripts do not use SSH or coordinate processes across machines.
+The scripts are intentionally local-only: run Client commands on the Client VM, Server
+commands on the Server VM, and router commands from the Linux shell on the VyOS VM. No
+SSH orchestration is used. Client means Sender, and Server means Receiver.
 
-Client means Sender, and Server means Receiver throughout the project. The topology is:
+### Script Usage
+
+#### `setup_case.sh`
+
+Configures the local VM for one test case.
+
+```bash
+sudo ./scripts/setup_case.sh <client|server|router> <1|2|3> <1500|9001>
+```
+
+#### `verify_network.sh`
+
+Displays the current network configuration and recommended validation commands without
+modifying the configuration.
+
+```bash
+./scripts/verify_network.sh <client|server|router> <1|2|3> <1500|9001>
+```
+
+#### `run_transfer.sh`
+
+Runs one local FRFT endpoint. Always start the Server/Receiver first. If `output_log` is
+provided, output is displayed and saved using `tee`.
+
+Client/Sender:
+
+```bash
+./scripts/run_transfer.sh client <mtu> <rate_mbps> <input_file> [output_log]
+```
+
+Server/Receiver:
+
+```bash
+./scripts/run_transfer.sh server <mtu> <output_file> [output_log]
+```
+
+#### `verify_md5.sh`
+
+Compares two files available on the same local VM.
+
+```bash
+./scripts/verify_md5.sh <original_file> <received_file>
+```
+
+### Test Topology
 
 ```text
 Client/Sender 192.168.20.100
@@ -62,7 +106,7 @@ VyOS eth1 192.168.10.1
 Server/Receiver 192.168.10.100
 ```
 
-The mandatory cases are:
+### Mandatory Cases
 
 | Case | Expected RTT | Router netem on each egress | Client/Server rate | Router rate |
 | --- | --- | --- | --- | --- |
@@ -70,32 +114,32 @@ The mandatory cases are:
 | 2 | about 200 ms | 100 ms delay, 20% loss | 100 Mbps | 100 Mbps |
 | 3 | about 200 ms | 100 ms delay, no configured loss | 100 Mbps | 80 Mbps |
 
-Run every required case with both MTU 1500 and MTU 9001. Each machine must be configured
-independently with:
+Test every mandatory case with both:
 
-```bash
-sudo ./scripts/setup_case.sh <client|server|router> <1|2|3> <1500|9001>
-```
+- MTU 1500
+- MTU 9001
 
-For example, configure Case 3 with MTU 1500 on the Client VM:
+### Complete Example: Case 3, MTU 1500
+
+#### Step 1: Configure the Client VM
 
 ```bash
 sudo ./scripts/setup_case.sh client 3 1500
 ```
 
-On the Server VM:
+#### Step 2: Configure the Server VM
 
 ```bash
 sudo ./scripts/setup_case.sh server 3 1500
 ```
 
-On the VyOS VM:
+#### Step 3: Configure the VyOS VM
 
 ```bash
 sudo ./scripts/setup_case.sh router 3 1500
 ```
 
-Inspect the resulting configuration without changing it:
+#### Step 4: Inspect Each Machine
 
 ```bash
 # Client VM
@@ -108,63 +152,66 @@ Inspect the resulting configuration without changing it:
 ./scripts/verify_network.sh router 3 1500
 ```
 
-Always run the Server/Receiver first. On the Server VM:
+Always start the Server/Receiver before the Client/Sender.
+
+#### Step 5: Start the Server/Receiver First
 
 ```bash
 ./scripts/run_transfer.sh server 1500 data/received_1g.bin \
     results/case3_mtu1500_server.log
 ```
 
-Then run the Client/Sender on the Client VM:
+#### Step 6: Start the Client/Sender
 
 ```bash
 ./scripts/run_transfer.sh client 1500 85 data/data_1g.bin \
     results/case3_mtu1500_rate85_client.log
 ```
 
-`run_transfer.sh` runs one local endpoint only. Its complete syntax is:
+### MTU 9001
+
+Use the same workflow with `9001` in place of `1500`. For example:
 
 ```bash
-./scripts/run_transfer.sh client <mtu> <rate_mbps> <input_file> [output_log]
-./scripts/run_transfer.sh server <mtu> <output_file> [output_log]
-```
-
-When a log path is supplied, output is displayed and saved with `tee`.
-
-For an MTU 9001 Case 3 experiment, configure each machine locally:
-
-```bash
-# Client VM
 sudo ./scripts/setup_case.sh client 3 9001
-
-# Server VM
 sudo ./scripts/setup_case.sh server 3 9001
-
-# VyOS VM
 sudo ./scripts/setup_case.sh router 3 9001
 ```
 
-Then start the Server/Receiver:
+Server/Receiver:
 
 ```bash
 ./scripts/run_transfer.sh server 9001 data/received_1g.bin
 ```
 
-Finally, start the Client/Sender:
+Client/Sender:
 
 ```bash
 ./scripts/run_transfer.sh client 9001 100 data/data_1g.bin
 ```
 
-`verify_md5.sh` compares two files available on the same local VM:
+### MD5 Verification
+
+If both files are available on the same VM:
 
 ```bash
 ./scripts/verify_md5.sh data/data_1g.bin data/received_1g.bin
 ```
 
-Because the original and received files normally reside on separate VMs, run `md5sum`
-separately on the Client and Server and compare the displayed hashes manually unless both
-files have been placed on one VM.
+Normally the source file is on the Client VM and the received file is on the Server VM.
+Run these commands separately and compare the hashes manually.
+
+Client/Sender:
+
+```bash
+md5sum data/data_1g.bin
+```
+
+Server/Receiver:
+
+```bash
+md5sum data/received_1g.bin
+```
 
 ## Stage 2 Reliability
 
