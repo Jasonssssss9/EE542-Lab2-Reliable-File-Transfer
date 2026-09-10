@@ -168,8 +168,74 @@ void test_fast_retransmit() {
           "three later ACKed chunks make the missing chunk retransmission-pending");
     const auto retransmission = sender.select_next_packet();
     check(retransmission && retransmission->retransmission &&
-              retransmission->sequence == 100,
+              retransmission->fast_retransmission && retransmission->sequence == 100,
           "pending retransmission is selected before new DATA");
+}
+
+void test_repeated_fast_retransmit_requires_new_sack_evidence() {
+    const auto sent_time = std::chrono::steady_clock::now();
+    frft::SenderWindow sender(115, 115);
+    send_initial_chunks(sender, 115, sent_time);
+
+    frft::AckPayload first_gap_ack {100, 104, 100, 16, std::vector<std::uint8_t>(2, 0)};
+    set_ack_bit(first_gap_ack, 1);
+    set_ack_bit(first_gap_ack, 2);
+    set_ack_bit(first_gap_ack, 3);
+    sender.process_ack(first_gap_ack, sent_time + std::chrono::milliseconds(200));
+
+    const auto first_retransmission = sender.select_next_packet();
+    check(first_retransmission && first_retransmission->retransmission &&
+              first_retransmission->fast_retransmission &&
+              first_retransmission->sequence == 100,
+          "first SACK threshold schedules a fast retransmission");
+    sender.mark_sent(100, sent_time + std::chrono::milliseconds(200));
+
+    sender.process_ack(first_gap_ack, sent_time + std::chrono::milliseconds(250));
+    check(!sender.retransmit_pending(100),
+          "duplicate SACK evidence does not schedule another retransmission");
+
+    frft::AckPayload more_progress {100, 107, 100, 16, std::vector<std::uint8_t>(2, 0)};
+    for (std::uint32_t bit = 1; bit <= 6; ++bit) {
+        set_ack_bit(more_progress, bit);
+    }
+    sender.process_ack(more_progress, sent_time + std::chrono::milliseconds(300));
+    check(!sender.retransmit_pending(100),
+          "new SACK evidence cannot retry before the conservative delay");
+
+    sender.process_ack(more_progress, sent_time + std::chrono::milliseconds(451));
+    check(!sender.retransmit_pending(100),
+          "a duplicate SACK cannot trigger a retry after the delay expires");
+
+    frft::AckPayload eligible_progress {100, 108, 100, 16, std::vector<std::uint8_t>(2, 0)};
+    for (std::uint32_t bit = 1; bit <= 7; ++bit) {
+        set_ack_bit(eligible_progress, bit);
+    }
+    sender.process_ack(eligible_progress, sent_time + std::chrono::milliseconds(452));
+    sender.process_ack(eligible_progress, sent_time + std::chrono::milliseconds(452));
+    check(sender.retransmit_pending(100),
+          "three newly ACKed later chunks allow one repeated fast retransmission");
+    const auto repeated_retransmission = sender.select_next_packet();
+    check(repeated_retransmission && repeated_retransmission->retransmission &&
+              repeated_retransmission->fast_retransmission &&
+              repeated_retransmission->sequence == 100,
+          "repeated fast retransmission keeps its scheduling reason");
+    check(!sender.select_next_packet(),
+          "duplicate ACK processing cannot queue the same retransmission twice");
+    sender.mark_sent(100, sent_time + std::chrono::milliseconds(452));
+
+    frft::AckPayload third_progress {100, 111, 100, 16, std::vector<std::uint8_t>(2, 0)};
+    for (std::uint32_t bit = 1; bit <= 10; ++bit) {
+        set_ack_bit(third_progress, bit);
+    }
+    sender.process_ack(third_progress, sent_time + std::chrono::milliseconds(752));
+    check(sender.retransmit_pending(100),
+          "another three newly ACKed chunks can schedule a later retry");
+
+    frft::AckPayload gap_filled {115, 115, 115, 16, std::vector<std::uint8_t>(2, 0)};
+    sender.process_ack(gap_filled, sent_time + std::chrono::milliseconds(753));
+    check(sender.state(100) == frft::PacketState::ACKED,
+          "cumulative ACK marks a pending retransmission ACKED");
+    check(!sender.select_next_packet(), "an ACKed chunk is never retransmitted");
 }
 
 void test_duplicate_and_reordered_ack_safety() {
@@ -203,6 +269,10 @@ void test_rto_and_completion() {
                           std::chrono::milliseconds(500));
     check(sender.retransmit_pending(0), "expired in-flight chunk becomes pending");
     check(!sender.retransmit_pending(1), "ACKed chunk does not time out");
+    const auto retransmission = sender.select_next_packet();
+    check(retransmission && retransmission->retransmission &&
+              !retransmission->fast_retransmission && retransmission->sequence == 0,
+          "RTO retransmission keeps its timeout scheduling reason");
 
     frft::AckPayload complete {2, 2, 2, 8, std::vector<std::uint8_t>(1, 0)};
     sender.process_ack(complete);
@@ -217,6 +287,7 @@ int main() {
     test_receiver_sack_and_gap_filling();
     test_sender_ack_processing_and_window();
     test_fast_retransmit();
+    test_repeated_fast_retransmit_requires_new_sack_evidence();
     test_duplicate_and_reordered_ack_safety();
     test_rto_and_completion();
     if (failures != 0) {

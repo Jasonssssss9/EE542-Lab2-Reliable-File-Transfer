@@ -29,7 +29,9 @@ public:
     std::optional<SendDecision> select_next_packet();
     void mark_sent(std::uint32_t sequence,
                    std::chrono::steady_clock::time_point send_time);
-    void process_ack(const AckPayload& ack);
+    void process_ack(
+        const AckPayload& ack,
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
     void check_timeouts(std::chrono::steady_clock::time_point now,
                         std::chrono::milliseconds rto);
 
@@ -49,12 +51,14 @@ private:
         bool retransmit_pending = false;
         bool fast_retransmit_pending = false;
         bool fast_retransmitted = false;
+        std::uint32_t latest_later_acked = 0;
+        std::uint32_t retransmit_evidence = 0;
     };
 
     bool can_send_new() const;
     void mark_acked(std::uint32_t sequence);
     void queue_retransmission(std::uint32_t sequence, bool fast_retransmit);
-    void advance_base();
+    void advance_base(std::chrono::steady_clock::time_point now);
 
     std::uint32_t total_chunks_;
     std::uint32_t window_chunks_;

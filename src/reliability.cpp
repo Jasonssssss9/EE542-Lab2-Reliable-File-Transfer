@@ -5,6 +5,12 @@
 #include <stdexcept>
 
 namespace frft {
+namespace {
+
+constexpr auto kRepeatedFastRetransmitDelay =
+    std::chrono::milliseconds(kDefaultRtoMs / 2);
+
+}  // namespace
 
 SenderWindow::SenderWindow(std::uint32_t total_chunks, std::uint32_t window_chunks)
     : total_chunks_(total_chunks),
@@ -32,6 +38,7 @@ std::optional<SendDecision> SenderWindow::select_next_packet() {
             const bool fast_retransmission = chunk.fast_retransmit_pending;
             chunk.fast_retransmit_pending = false;
             chunk.fast_retransmitted = true;
+            chunk.retransmit_evidence = chunk.latest_later_acked;
             return SendDecision {sequence, true, fast_retransmission};
         }
     }
@@ -73,13 +80,12 @@ void SenderWindow::queue_retransmission(std::uint32_t sequence, bool fast_retran
     retransmission_queue_.push_back(sequence);
 }
 
-void SenderWindow::advance_base() {
+void SenderWindow::advance_base(std::chrono::steady_clock::time_point now) {
     const std::uint32_t previous_base = base_;
     while (base_ < total_chunks_ && chunks_[base_].state == PacketState::ACKED) {
         ++base_;
     }
     if (base_ != previous_base) {
-        const auto now = std::chrono::steady_clock::now();
         const auto stall_time =
             std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_base_advance_time_);
         total_base_stall_time_ += stall_time;
@@ -89,7 +95,8 @@ void SenderWindow::advance_base() {
     }
 }
 
-void SenderWindow::process_ack(const AckPayload& ack) {
+void SenderWindow::process_ack(const AckPayload& ack,
+                               std::chrono::steady_clock::time_point now) {
     const std::uint32_t prefix_end =
         std::min({ack.cumulative_ack, total_chunks_, next_sequence_});
     for (std::uint32_t sequence = base_; sequence < prefix_end; ++sequence) {
@@ -115,7 +122,7 @@ void SenderWindow::process_ack(const AckPayload& ack) {
         }
     }
 
-    advance_base();
+    advance_base(now);
 
     std::uint32_t later_acked = 0;
     for (std::uint32_t sequence = next_sequence_; sequence > base_;) {
@@ -123,10 +130,19 @@ void SenderWindow::process_ack(const AckPayload& ack) {
         ChunkState& chunk = chunks_[sequence];
         if (chunk.state == PacketState::ACKED) {
             ++later_acked;
-        } else if (chunk.state == PacketState::IN_FLIGHT &&
-                   later_acked >= kFastRetransmitThreshold &&
-                   !chunk.fast_retransmitted) {
-            queue_retransmission(sequence, true);
+        } else if (chunk.state == PacketState::IN_FLIGHT) {
+            const bool has_new_later_sack = later_acked > chunk.latest_later_acked;
+            chunk.latest_later_acked = later_acked;
+            const bool has_new_sack_evidence =
+                later_acked >= chunk.retransmit_evidence &&
+                later_acked - chunk.retransmit_evidence >= kFastRetransmitThreshold;
+            const bool retry_delay_elapsed =
+                !chunk.fast_retransmitted ||
+                now - chunk.last_sent_time >= kRepeatedFastRetransmitDelay;
+            if (has_new_later_sack && has_new_sack_evidence && retry_delay_elapsed) {
+                // New SACK progress plus a conservative delay avoids retrying on duplicate ACKs.
+                queue_retransmission(sequence, true);
+            }
         }
     }
 }
