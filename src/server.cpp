@@ -109,7 +109,7 @@ void send_packet(int socket_fd,
 }
 
 bool receive_packet(int socket_fd,
-                    frft::Packet& packet,
+                    frft::PacketView& packet,
                     sockaddr_in& source,
                     std::vector<std::uint8_t>& buffer) {
     while (true) {
@@ -128,7 +128,7 @@ bool receive_packet(int socket_fd,
         }
 
         std::string error;
-        if (frft::deserialize_packet(buffer.data(), received, packet, error)) {
+        if (frft::deserialize_packet_view(buffer.data(), received, packet, error)) {
             return true;
         }
     }
@@ -194,13 +194,13 @@ void time_wait(int socket_fd,
             throw std::runtime_error(std::string("recvfrom failed: ") + std::strerror(errno));
         }
 
-        frft::Packet packet;
+        frft::PacketView packet;
         std::string error;
         if (same_endpoint(source, client) &&
-            frft::deserialize_packet(buffer.data(), received, packet, error) &&
+            frft::deserialize_packet_view(buffer.data(), received, packet, error) &&
             packet.header.session_id == session_id &&
             packet.header.type == frft::PacketType::COMPLETE &&
-            packet.header.number == total_chunks && packet.payload.empty()) {
+            packet.header.number == total_chunks && packet.payload_size == 0) {
             const auto header =
                 make_header(frft::PacketType::COMPLETE_ACK, session_id, total_chunks);
             send_packet(socket_fd,
@@ -242,14 +242,15 @@ int run_server(const Options& options) {
         std::cout << "Waiting for one client on UDP port " << options.port << "\n";
 
         std::vector<std::uint8_t> receive_buffer(65535);
-        frft::Packet start_packet;
+        frft::PacketView start_packet;
         sockaddr_in client {};
         frft::StartPayload start;
         while (true) {
             receive_packet(socket_fd, start_packet, client, receive_buffer);
             if (start_packet.header.type != frft::PacketType::START ||
                 start_packet.header.session_id == 0 || start_packet.header.number != 0 ||
-                !frft::deserialize_start(start_packet.payload, start)) {
+                !frft::deserialize_start(
+                    start_packet.payload, start_packet.payload_size, start)) {
                 continue;
             }
 
@@ -305,7 +306,7 @@ int run_server(const Options& options) {
         std::chrono::steady_clock::time_point last_data_time;
 
         while (true) {
-            frft::Packet packet;
+            frft::PacketView packet;
             sockaddr_in source {};
             receive_packet(socket_fd, packet, source, receive_buffer);
 
@@ -330,7 +331,7 @@ int run_server(const Options& options) {
                 const std::uint64_t offset = static_cast<std::uint64_t>(sequence) * start.chunk_size;
                 const std::size_t expected_size = static_cast<std::size_t>(
                     std::min<std::uint64_t>(start.chunk_size, start.file_size - offset));
-                if (packet.payload.size() != expected_size) {
+                if (packet.payload_size != expected_size) {
                     continue;
                 }
 
@@ -339,7 +340,7 @@ int run_server(const Options& options) {
                     ++duplicate_packets;
                 } else {
                     if (expected_size != 0) {
-                        std::memcpy(output->data() + offset, packet.payload.data(), expected_size);
+                        std::memcpy(output->data() + offset, packet.payload, expected_size);
                     }
                     tracker.mark_received(sequence);
                     const auto now = std::chrono::steady_clock::now();
@@ -393,7 +394,7 @@ int run_server(const Options& options) {
             }
 
             if (packet.header.type != frft::PacketType::COMPLETE ||
-                packet.header.number != start.total_chunks || !packet.payload.empty()) {
+                packet.header.number != start.total_chunks || packet.payload_size != 0) {
                 continue;
             }
             if (!tracker.complete() || tracker.cumulative_ack() != start.total_chunks) {

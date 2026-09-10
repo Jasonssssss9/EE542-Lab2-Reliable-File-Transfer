@@ -23,6 +23,7 @@
 #include <netinet/ip.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace {
@@ -243,16 +244,47 @@ void send_packet(int socket_fd,
     }
 }
 
+void send_data_packet(int socket_fd,
+                      const sockaddr_in& server,
+                      const frft::PacketHeader& header,
+                      const std::uint8_t* payload,
+                      std::size_t payload_size) {
+    if (payload_size != 0 && payload == nullptr) {
+        throw std::invalid_argument("packet payload is null");
+    }
+
+    auto serialized_header = frft::serialize_packet_header(header, payload_size);
+    iovec parts[2] {
+        {serialized_header.data(), serialized_header.size()},
+        {const_cast<std::uint8_t*>(payload), payload_size},
+    };
+    msghdr message {};
+    message.msg_name = const_cast<sockaddr_in*>(&server);
+    message.msg_namelen = sizeof(server);
+    message.msg_iov = parts;
+    message.msg_iovlen = 2;
+
+    ssize_t sent;
+    do {
+        sent = sendmsg(socket_fd, &message, 0);
+    } while (sent < 0 && errno == EINTR);
+
+    const std::size_t datagram_size = serialized_header.size() + payload_size;
+    if (sent < 0 || static_cast<std::size_t>(sent) != datagram_size) {
+        throw std::runtime_error(std::string("sendmsg failed: ") + std::strerror(errno));
+    }
+}
+
 bool receive_expected(int socket_fd,
                       const sockaddr_in& server,
                       frft::PacketType expected_type,
                       std::uint32_t session_id,
                       int timeout_ms,
-                      frft::Packet& result,
+                      frft::PacketView& result,
+                      std::vector<std::uint8_t>& buffer,
                       TimingStats* poll_diagnostics = nullptr) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeout_ms);
-    std::vector<std::uint8_t> buffer(65535);
 
     while (std::chrono::steady_clock::now() < deadline) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -291,10 +323,10 @@ bool receive_expected(int socket_fd,
             throw std::runtime_error(std::string("recvfrom failed: ") + std::strerror(errno));
         }
 
-        frft::Packet packet;
+        frft::PacketView packet;
         std::string error;
         if (!same_endpoint(source, server) ||
-            !frft::deserialize_packet(buffer.data(), received, packet, error) ||
+            !frft::deserialize_packet_view(buffer.data(), received, packet, error) ||
             packet.header.session_id != session_id || packet.header.type != expected_type) {
             continue;
         }
@@ -304,10 +336,11 @@ bool receive_expected(int socket_fd,
     return false;
 }
 
-void apply_ack_packet(const frft::Packet& packet, frft::SenderWindow& window) {
-    frft::AckPayload ack;
+void apply_ack_packet(const frft::PacketView& packet,
+                      frft::SenderWindow& window,
+                      frft::AckPayload& ack) {
     if ((packet.header.flags & frft::FLAG_SACK) == 0 ||
-        !frft::deserialize_ack(packet.payload, ack) ||
+        !frft::deserialize_ack(packet.payload, packet.payload_size, ack) ||
         ack.bitmap_bits != frft::kDefaultAckBitmapBits) {
         return;
     }
@@ -317,8 +350,9 @@ void apply_ack_packet(const frft::Packet& packet, frft::SenderWindow& window) {
 void drain_acks(int socket_fd,
                 const sockaddr_in& server,
                 std::uint32_t session_id,
-                frft::SenderWindow& window) {
-    std::vector<std::uint8_t> buffer(65535);
+                frft::SenderWindow& window,
+                std::vector<std::uint8_t>& buffer,
+                frft::AckPayload& ack) {
     while (true) {
         sockaddr_in source {};
         socklen_t source_length = sizeof(source);
@@ -338,12 +372,12 @@ void drain_acks(int socket_fd,
             throw std::runtime_error(std::string("recvfrom failed: ") + std::strerror(errno));
         }
 
-        frft::Packet packet;
+        frft::PacketView packet;
         std::string error;
         if (same_endpoint(source, server) &&
-            frft::deserialize_packet(buffer.data(), received, packet, error) &&
+            frft::deserialize_packet_view(buffer.data(), received, packet, error) &&
             packet.header.session_id == session_id && packet.header.type == frft::PacketType::ACK) {
-            apply_ack_packet(packet, window);
+            apply_ack_packet(packet, window, ack);
         }
     }
 }
@@ -352,16 +386,19 @@ void wait_for_ack(int socket_fd,
                   const sockaddr_in& server,
                   std::uint32_t session_id,
                   frft::SenderWindow& window,
+                  std::vector<std::uint8_t>& buffer,
+                  frft::AckPayload& ack,
                   TimingStats& poll_diagnostics) {
-    frft::Packet packet;
+    frft::PacketView packet;
     if (receive_expected(socket_fd,
                          server,
                          frft::PacketType::ACK,
                          session_id,
                          10,
                          packet,
+                         buffer,
                          &poll_diagnostics)) {
-        apply_ack_packet(packet, window);
+        apply_ack_packet(packet, window, ack);
     }
 }
 
@@ -397,6 +434,9 @@ int run_client(const Options& options) {
                                      std::strerror(errno));
         }
 
+        std::vector<std::uint8_t> receive_buffer(65535);
+        frft::AckPayload ack_scratch;
+
         const std::uint32_t session_id = random_session_id();
         const frft::StartPayload start {
             input.size(),
@@ -417,16 +457,18 @@ int run_client(const Options& options) {
                         start_header,
                         start_payload.data(),
                         start_payload.size());
-            frft::Packet response;
+            frft::PacketView response;
             if (!receive_expected(socket_fd,
                                   server,
                                   frft::PacketType::START_ACK,
                                   session_id,
                                   frft::kControlTimeoutMs,
-                                  response)) {
+                                  response,
+                                  receive_buffer)) {
                 continue;
             }
-            if (!frft::deserialize_start_ack(response.payload, accepted)) {
+            if (!frft::deserialize_start_ack(
+                    response.payload, response.payload_size, accepted)) {
                 throw std::runtime_error("server returned an invalid START_ACK");
             }
             if (accepted.status != frft::StatusCode::OK) {
@@ -455,7 +497,12 @@ int run_client(const Options& options) {
                                   std::chrono::milliseconds(100);
 
         while (!window.all_acked()) {
-            drain_acks(socket_fd, server, session_id, window);
+            drain_acks(socket_fd,
+                       server,
+                       session_id,
+                       window,
+                       receive_buffer,
+                       ack_scratch);
             window.check_timeouts(std::chrono::steady_clock::now(),
                                   std::chrono::milliseconds(frft::kDefaultRtoMs));
 
@@ -479,6 +526,8 @@ int run_client(const Options& options) {
                              server,
                              session_id,
                              window,
+                             receive_buffer,
+                             ack_scratch,
                              diagnostics.poll_wait);
                 const auto idle_duration =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -514,7 +563,7 @@ int run_client(const Options& options) {
                 first_data_time = std::chrono::steady_clock::now();
                 sent_first_data = true;
             }
-            send_packet(socket_fd, server, header, input.data() + offset, payload_size);
+            send_data_packet(socket_fd, server, header, input.data() + offset, payload_size);
             window.mark_sent(sequence, std::chrono::steady_clock::now());
             ++sent_data_packets;
             if (decision->retransmission) {
@@ -525,7 +574,12 @@ int run_client(const Options& options) {
                     ++diagnostics.rto_retransmits;
                 }
             }
-            drain_acks(socket_fd, server, session_id, window);
+            drain_acks(socket_fd,
+                       server,
+                       session_id,
+                       window,
+                       receive_buffer,
+                       ack_scratch);
         }
         diagnostics.end_no_send(std::chrono::steady_clock::now());
 
@@ -535,16 +589,18 @@ int run_client(const Options& options) {
         bool finished = false;
         for (int attempt = 0; attempt < frft::kControlAttempts && !finished; ++attempt) {
             send_packet(socket_fd, server, complete_header, nullptr, 0);
-            frft::Packet response;
+            frft::PacketView response;
             if (!receive_expected(socket_fd,
                                   server,
                                   frft::PacketType::COMPLETE_ACK,
                                   session_id,
                                   frft::kControlTimeoutMs,
-                                  response)) {
+                                  response,
+                                  receive_buffer)) {
                 continue;
             }
-            if (!frft::deserialize_complete_ack(response.payload, completed)) {
+            if (!frft::deserialize_complete_ack(
+                    response.payload, response.payload_size, completed)) {
                 throw std::runtime_error("server returned an invalid COMPLETE_ACK");
             }
             finished = completed.status == frft::StatusCode::OK;

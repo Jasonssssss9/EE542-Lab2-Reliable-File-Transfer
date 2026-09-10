@@ -2,6 +2,7 @@
 
 #include "common.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -51,6 +52,12 @@ struct Packet {
     std::vector<std::uint8_t> payload;
 };
 
+struct PacketView {
+    PacketHeader header;
+    const std::uint8_t* payload = nullptr;
+    std::size_t payload_size = 0;
+};
+
 struct StartPayload {
     std::uint64_t file_size = 0;
     std::uint32_t chunk_size = 0;
@@ -85,24 +92,41 @@ struct CompleteAckPayload {
 std::uint32_t chunk_size_for_mtu(std::uint32_t mtu);
 std::uint32_t chunk_count(std::uint64_t file_size, std::uint32_t chunk_size);
 
+std::array<std::uint8_t, kHeaderSize> serialize_packet_header(
+    const PacketHeader& header,
+    std::size_t payload_size);
 std::vector<std::uint8_t> serialize_packet(const PacketHeader& header,
                                            const std::uint8_t* payload,
                                            std::size_t payload_size);
+bool deserialize_packet_view(const std::uint8_t* data,
+                             std::size_t size,
+                             PacketView& packet,
+                             std::string& error);
 bool deserialize_packet(const std::uint8_t* data,
                         std::size_t size,
                         Packet& packet,
                         std::string& error);
 
 std::vector<std::uint8_t> serialize_start(const StartPayload& payload);
+bool deserialize_start(const std::uint8_t* data,
+                       std::size_t size,
+                       StartPayload& payload);
 bool deserialize_start(const std::vector<std::uint8_t>& data, StartPayload& payload);
 
 std::vector<std::uint8_t> serialize_start_ack(const StartAckPayload& payload);
+bool deserialize_start_ack(const std::uint8_t* data,
+                           std::size_t size,
+                           StartAckPayload& payload);
 bool deserialize_start_ack(const std::vector<std::uint8_t>& data, StartAckPayload& payload);
 
 std::vector<std::uint8_t> serialize_ack(const AckPayload& payload);
+bool deserialize_ack(const std::uint8_t* data, std::size_t size, AckPayload& payload);
 bool deserialize_ack(const std::vector<std::uint8_t>& data, AckPayload& payload);
 
 std::vector<std::uint8_t> serialize_complete_ack(const CompleteAckPayload& payload);
+bool deserialize_complete_ack(const std::uint8_t* data,
+                              std::size_t size,
+                              CompleteAckPayload& payload);
 bool deserialize_complete_ack(const std::vector<std::uint8_t>& data,
                               CompleteAckPayload& payload);
 

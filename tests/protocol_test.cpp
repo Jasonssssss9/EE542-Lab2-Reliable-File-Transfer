@@ -1,6 +1,7 @@
 #include "protocol.hpp"
 #include "reliability.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
@@ -45,11 +46,15 @@ void test_header_and_data() {
     const std::vector<std::uint8_t> payload {0x10, 0x20, 0x30};
     frft::PacketHeader header;
     header.type = frft::PacketType::DATA;
+    header.flags = frft::FLAG_RETRANSMITTED;
     header.session_id = 0x12345678;
     header.number = 42;
 
     const auto bytes = frft::serialize_packet(header, payload.data(), payload.size());
+    const auto serialized_header = frft::serialize_packet_header(header, payload.size());
     check(bytes.size() == frft::kHeaderSize + payload.size(), "serialized DATA length");
+    check(std::equal(serialized_header.begin(), serialized_header.end(), bytes.begin()),
+          "scatter/gather header matches the complete packet header");
     check(bytes[0] == 0x46 && bytes[1] == 0x52 && bytes[2] == 0x46 && bytes[3] == 0x54,
           "magic is encoded in network byte order");
     check(bytes[5] == static_cast<std::uint8_t>(frft::PacketType::DATA), "DATA type byte");
@@ -62,20 +67,39 @@ void test_header_and_data() {
           "serialized DATA can be decoded");
     check(decoded.header.session_id == header.session_id, "session ID round trip");
     check(decoded.header.number == 42, "chunk number round trip");
+    check(decoded.header.flags == frft::FLAG_RETRANSMITTED,
+          "DATA flags survive header serialization");
     check(decoded.payload == payload, "DATA payload round trip");
+
+    frft::PacketView view;
+    check(frft::deserialize_packet_view(bytes.data(), bytes.size(), view, error),
+          "serialized DATA can be decoded without copying its payload");
+    check(view.header.session_id == header.session_id && view.header.number == 42,
+          "packet view header round trip");
+    check(view.payload == bytes.data() + frft::kHeaderSize &&
+              view.payload_size == payload.size() &&
+              std::equal(payload.begin(), payload.end(), view.payload),
+          "packet view refers to the payload in the receive buffer");
 
     auto malformed = bytes;
     malformed[0] = 0;
     check(!frft::deserialize_packet(malformed.data(), malformed.size(), decoded, error),
           "bad magic is rejected");
+    check(!frft::deserialize_packet_view(
+              malformed.data(), malformed.size(), view, error),
+          "packet view rejects bad magic");
     check(!frft::deserialize_packet(bytes.data(), bytes.size() - 1, decoded, error),
           "wrong datagram length is rejected");
+    check(!frft::deserialize_packet_view(
+              bytes.data(), bytes.size() - 1, view, error),
+          "packet view rejects a wrong datagram length");
 }
 
 void test_control_payloads() {
     const frft::StartPayload start {0x0102030405060708ULL, 1448, 1234, 512, 8192, 10};
+    const auto start_bytes = frft::serialize_start(start);
     frft::StartPayload decoded_start;
-    check(frft::deserialize_start(frft::serialize_start(start), decoded_start),
+    check(frft::deserialize_start(start_bytes.data(), start_bytes.size(), decoded_start),
           "START payload decodes");
     check(decoded_start.file_size == start.file_size &&
               decoded_start.chunk_size == start.chunk_size &&
@@ -84,8 +108,10 @@ void test_control_payloads() {
           "START payload round trip");
 
     const frft::StartAckPayload start_ack {frft::StatusCode::OK, 512, 8192, 10};
+    const auto start_ack_bytes = frft::serialize_start_ack(start_ack);
     frft::StartAckPayload decoded_start_ack;
-    check(frft::deserialize_start_ack(frft::serialize_start_ack(start_ack), decoded_start_ack),
+    check(frft::deserialize_start_ack(
+              start_ack_bytes.data(), start_ack_bytes.size(), decoded_start_ack),
           "START_ACK payload decodes");
     check(decoded_start_ack.status == frft::StatusCode::OK &&
               decoded_start_ack.accepted_window_chunks == 512,
@@ -94,8 +120,10 @@ void test_control_payloads() {
     frft::AckPayload ack {100, 104, 100, 16, std::vector<std::uint8_t>(2, 0)};
     set_ack_bit(ack, 1);
     set_ack_bit(ack, 3);
+    const auto ack_bytes = frft::serialize_ack(ack);
     frft::AckPayload decoded_ack;
-    check(frft::deserialize_ack(frft::serialize_ack(ack), decoded_ack), "ACK payload decodes");
+    check(frft::deserialize_ack(ack_bytes.data(), ack_bytes.size(), decoded_ack),
+          "ACK payload decodes");
     check(decoded_ack.cumulative_ack == 100 && decoded_ack.bitmap_base == 100 &&
               decoded_ack.bitmap_bits == 16,
           "ACK prefix survives round trip");
@@ -103,8 +131,10 @@ void test_control_payloads() {
 
     const frft::CompleteAckPayload complete {
         frft::StatusCode::OK, 1234, 0x0102030405060708ULL, 987654};
+    const auto complete_bytes = frft::serialize_complete_ack(complete);
     frft::CompleteAckPayload decoded_complete;
-    check(frft::deserialize_complete_ack(frft::serialize_complete_ack(complete), decoded_complete),
+    check(frft::deserialize_complete_ack(
+              complete_bytes.data(), complete_bytes.size(), decoded_complete),
           "COMPLETE_ACK payload decodes");
     check(decoded_complete.received_bytes == complete.received_bytes &&
               decoded_complete.receiver_transfer_time_us == complete.receiver_transfer_time_us,
